@@ -1,0 +1,13 @@
+node_modules/
+dist/
+artifacts/
+*.log
+*.pid
+control.json
+control_result.json
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.pyc
+/tmp/
