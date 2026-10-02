@@ -10,8 +10,12 @@
       "onFail": "ignore"
     }
   },
+  "bin": {
+    "browsee": "bin/browsee.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "nub exec tsc -p tsconfig.build.json",
     "start": "bash run.sh",
     "e2e": "node e2e-test.mjs"
   },
