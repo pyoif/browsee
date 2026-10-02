@@ -11,7 +11,7 @@
 // prebuilt artifact checked in (dist/ is gitignored).
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -62,4 +62,6 @@ if (!existsSync(entry)) {
   }
 }
 
-await import(entry);
+// On Windows a raw absolute path like C:\... parses as a URL with scheme "c:",
+// which throws ERR_UNSUPPORTED_ESM_URL_SCHEME. Convert to a file:// URL first.
+await import(pathToFileURL(entry).href);
