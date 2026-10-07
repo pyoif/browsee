@@ -2,19 +2,22 @@
 /**
  * browsee — a stdio MCP server exposing scriptable browser sessions.
  *
- * Engines:
- *   - "camoufox" (default, stealth=true): launches the camoufox binary fetched
- *     by `camoufox fetch` with LD_LIBRARY_PATH pointed at the pixi GTK env so
- *     the Firefox build can find libgtk-3 etc. Driven by vanilla
- *     playwright-core's firefox() — patchright's patched firefox driver is NOT
- *     compatible with camoufox's patched juggler (page.evaluate breaks).
- *   - "chromium" (stealth=false): launches a Chromium build driven by PATCHRIGHT
- *     (the patched, undetectable Playwright fork), which must already be
- *     installed (we never download on the fly; see browser_install_chromium).
- *     Patchright's stealth comes from the patched driver code, so the driver
- *     library — not just the browser binary — is what makes this undetectable.
- *     This is the deliberate split: patchright for chromium, playwright-core
- *     for the camoufox/firefox path.
+ * Engines (browser_spawn takes engine: "firefox" | "chrome"):
+ *   - "firefox" (default): the camoufox Firefox engine — full anti-fingerprint
+ *     capability (config/fingerprint/addons/locale/geoip/humanize). Launched
+ *     with LD_LIBRARY_PATH pointed at the pixi GTK env so the build finds
+ *     libgtk-3 etc., and driven by vanilla playwright-core's firefox() —
+ *     patchright's patched firefox driver is NOT compatible with camoufox's
+ *     patched juggler (page.evaluate breaks).
+ *   - "chrome": branded Chrome For Testing driven by PATCHRIGHT (the patched,
+ *     undetectable Playwright fork), launched headed via Xvfb. Patchright's
+ *     stealth comes from the patched driver code, so the driver library — not
+ *     just the browser binary — is what makes this undetectable. The browser
+ *     must already be installed (we never download on the fly; see
+ *     browser_install_chromium).
+ *     This is the deliberate split: patchright for chrome, playwright-core for
+ *     the camoufox/firefox engine. Both are stealth-optimized; engine selects
+ *     the browser stack, not stealth on/off.
  *
  * Sessions are tracked in-memory. On SIGTERM/SIGINT/exit every live session is
  * killed so no browser processes are orphaned (zombie prevention).
@@ -47,12 +50,9 @@ import { readdirSync as readdirSyncFs, readlinkSync } from "node:fs";
 import { extractAll } from "./zip.js";
 import { downloadToBuffer, downloadText, logStderr } from "./download.js";
 import {
-  buildCamoufoxPlan,
-  findAddonDirs,
+  assembleCamoufoxOptions,
   isOnPath,
-  loadSupportedProperties,
-  planDisplay,
-  readRelease,
+  resolveInstallDir,
   type CamoufoxSpawnOptions,
 } from "./camoufox.js";
 
@@ -67,21 +67,6 @@ mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
 /** GTK/X11 libs shipped by the pixi env, needed by camoufox's Firefox build. */
 const GTK_LIB_DIR = join(HOME, "camoufox", ".pixi", "envs", "default", "lib");
-
-/**
- * Locate the camoufox install directory (the dir containing camoufox-bin,
- * version.json, properties.json, fontconfig/ and — for the full release — the
- * addons/ tree). Honors CAMOUFOX_INSTALL_DIR.
- */
-function findCamoufoxDir(): string | null {
-  // Honor CAMOUFOX_INSTALL_DIR when set (the same env var browser_install_camoufox
-  // uses), so the two agree on where the browser lives.
-  const base =
-    process.env.CAMOUFOX_INSTALL_DIR && process.env.CAMOUFOX_INSTALL_DIR.trim() !== ""
-      ? process.env.CAMOUFOX_INSTALL_DIR
-      : join(HOME, ".cache", "camoufox");
-  return findCamoufoxInRoot(base)?.dir ?? null;
-}
 
 /** Return the tag/dir/bin of an existing camoufox build under `root`, if any. */
 function findExistingCamoufox(root: string): { tag: string; dir: string; bin: string } | null {
@@ -99,28 +84,11 @@ function findCamoufoxInRoot(root: string): { tag: string; dir: string; bin: stri
   return null;
 }
 
-/**
- * The camoufox release ships its addons next to the browser tree. Depending on
- * how it was installed the `addons/` dir lives either alongside the build
- * (`<installRoot>/addons`) or beside the binary. Return the first that exists.
- */
-function findCamoufoxAddonsRoot(installDir: string): string | null {
-  const candidates = [
-    join(installDir, "addons"),
-    // release root = two levels up from browsers/official/<tag>
-    join(dirname(dirname(installDir)), "addons"),
-  ];
-  for (const c of candidates) {
-    if (existsSync(c)) return c;
-  }
-  return null;
-}
-
 // ---------------------------------------------------------------------------
 // Session registry
 // ---------------------------------------------------------------------------
 
-type Engine = "camoufox" | "chromium";
+type Engine = "firefox" | "chrome";
 
 interface Session {
   id: string;
@@ -206,84 +174,65 @@ function findBrowserPid(exePath: string): number | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Launch the camoufox firefox engine with FULL capability: config assembled into
- * CAMOU_CONFIG_<n> env vars, the release's addons loaded, FONTCONFIG_PATH set,
- * and a headed/headless display plan (xvfb-run auto-wrap when available).
+ * Launch the camoufox firefox engine with FULL capability, via the official
+ * `camoufox` package (daijro/camoufox/typescript). The package owns fingerprint
+ * generation, CAMOU_CONFIG/CAMOU_PREFS assembly, addons, fonts, GeoIP, locale,
+ * humanize and virtual display. We only add container plumbing: the GTK/X11
+ * LD_LIBRARY_PATH (no system libgtk-3 in the Wolfi image) and the translation
+ * of browser_spawn's capability knobs into launchOptions().
  *
- * `options` carries the capability knobs (fingerprint, geoip, locale, humanize,
- * config). Headless handling: full fidelity needs a display; if none is present
- * we auto-use xvfb-run, else fall back to plain headless and say so.
+ * camoufox is a Firefox build, so it is driven by vanilla playwright-core's
+ * firefox() — patchright's patched firefox driver is incompatible with
+ * camoufox's patched juggler (page.evaluate breaks).
  */
 async function launchCamoufox(
   headless: boolean,
   startUrl: string | undefined,
   options: CamoufoxSpawnOptions = {},
 ): Promise<Session> {
-  const dir = findCamoufoxDir();
-  if (!dir) {
-    throw new Error(
-      "camoufox not found under ~/.cache/camoufox/browsers/official/*/camoufox-bin (or $CAMOUFOX_INSTALL_DIR) — run browser_install_camoufox, or `camoufox fetch`",
-    );
-  }
   if (!existsSync(GTK_LIB_DIR)) {
     throw new Error(
       `GTK lib dir not found at ${GTK_LIB_DIR} — the pixi env providing libgtk-3 is missing`,
     );
   }
 
-  const bin = join(dir, "camoufox-bin");
+  // The official launcher resolves the browser itself (its paired build by
+  // default, or whatever is active). We do not force executable_path unless an
+  // install already exists at the expected location, so a plain `Camoufox()`
+  // launch can still fetch/manage its build.
+  const { dir: installDir, exists: hasInstall } = resolveInstallDir(process.env);
+  const installed = hasInstall ? findExistingCamoufox(installDir) : null;
+  const bin = installed?.bin;
+  const browserDir = installed?.dir;
 
-  // Full release: gather addons + the build's supported-property schema.
-  const addonsRoot = findCamoufoxAddonsRoot(dir);
-  const addons = addonsRoot ? findAddonDirs(addonsRoot) : [];
-  const properties = loadSupportedProperties(dir);
-  const release = readRelease(dir);
-
-  // Base env: GTK/X11 libs from the pixi env + the browser's own dir (its
-  // bundled libxul/libnss etc. live next to the binary).
-  const baseEnv: Record<string, string> = { ...process.env } as Record<string, string>;
-  const existing = baseEnv.LD_LIBRARY_PATH ? `:${baseEnv.LD_LIBRARY_PATH}` : "";
-  baseEnv.LD_LIBRARY_PATH = `${GTK_LIB_DIR}:${dir}${existing}`;
-
-  // Display planning: headed (full fidelity) if a DISPLAY exists or xvfb-run is
-  // available; otherwise plain headless with an explicit note.
-  const hasXvfbRun = isOnPath("xvfb-run");
-  const display = baseEnv.DISPLAY;
-  const plan = planDisplay(headless, hasXvfbRun, display);
-  baseEnv.MOZ_HEADLESS = plan.headless ? "1" : "0";
-  if (plan.display) baseEnv.DISPLAY = plan.display;
-
-  const targetOs = "lin"; // container target
-  const launchPlan = buildCamoufoxPlan({
-    installDir: dir,
+  const launchOpts = await assembleCamoufoxOptions(options, {
+    headless,
+    homeDir: HOME,
+    processEnv: process.env,
     executablePath: bin,
-    properties,
-    addons,
-    options,
-    release,
-    baseEnv,
-    targetOs,
+    browserDir,
   });
 
   logStderr(
-    `camoufox launch: engine=firefox addons=${addons.length} properties=${properties.size} display=${plan.note}`,
+    `camoufox launch: engine=firefox headless=${headless} install=${hasInstall ? installDir : "(package-managed)"} display=${process.env.DISPLAY ?? "none"}`,
   );
 
-  // camoufox is a Firefox build driven by vanilla playwright-core's firefox()
-  // (patchright's patched firefox driver is incompatible with camoufox's
-  // patched juggler — page.evaluate breaks).
-  const launchOpts = {
-    executablePath: bin,
-    headless: plan.headless,
-    env: launchPlan.env,
-    firefoxUserPrefs: launchPlan.firefoxUserPrefs as Record<string, string | number | boolean>,
+  const browser = (await playwrightFirefox.launch({
+    ...launchOpts,
     timeout: 90_000,
-  };
-  const browser = (await playwrightFirefox.launch(launchOpts)) as unknown as Browser;
+  } as Parameters<typeof playwrightFirefox.launch>[0])) as unknown as Browser;
 
-  const session = await register(browser, "camoufox", startUrl, bin);
-  session.displayNote = plan.note;
-  session.addonsLoaded = addons.length;
+  const session = await register(browser, "firefox", startUrl, bin ?? null);
+  const cfgAddons = (launchOpts as { env?: Record<string, string> }).env?.CAMOU_CONFIG_1;
+  session.displayNote = process.env.DISPLAY ? `DISPLAY=${process.env.DISPLAY}` : "headless (no display)";
+  if (cfgAddons) {
+    try {
+      const parsed = JSON.parse(cfgAddons) as { addons?: unknown[] };
+      if (Array.isArray(parsed.addons)) session.addonsLoaded = parsed.addons.length;
+    } catch {
+      /* config chunk is split across CAMOU_CONFIG_2.. for large configs */
+    }
+  }
   return session;
 }
 
@@ -303,30 +252,59 @@ async function launchChromium(
     env.LD_LIBRARY_PATH = `${extraLibDirs.join(":")}${existing}`;
   }
 
+  // Patchright's own Best Practice is `chromium.launchPersistentContext(...,
+  // { channel: "chrome", headless: false, viewport: null })` — branded Chrome
+  // For Testing, headed. Patchright's `channel: "chrome"` resolves to the
+  // Chrome-for-Testing build (revision 1243), which is exactly what
+  // browser_install_chromium installs.
+  //
+  // Headed is required for stealth fidelity: patchright's patches only hold in
+  // a real (non-headless-shell) browser. On a server with no display we must
+  // run under Xvfb; if xvfb-run is unavailable we refuse rather than silently
+  // launch a detectable headless Chrome.
+  const display = env.DISPLAY;
+  const hasXvfbRun = isOnPath("xvfb-run");
+  let needXvfbRun = false;
+  if (display && display.trim() !== "") {
+    env.DISPLAY = display;
+  } else if (hasXvfbRun) {
+    needXvfbRun = true;
+  } else {
+    throw new Error(
+      "Chrome engine requires a display (patchright's stealth patches need a headed browser). " +
+        "No DISPLAY is set and xvfb-run is not installed. Install xvfb (e.g. `apt-get install -y xvfb`) " +
+        "or set DISPLAY, then retry.",
+    );
+  }
+
+  const launchArgs = ["--no-sandbox", "--disable-dev-shm-usage"];
+
   let browser: Browser;
   try {
     // patchright chromium is API-identical to playwright-core's; its nominal
     // types just live in a different package. Cast so both engines share the
     // playwright-core-typed Session.
     browser = (await patchrightChromium.launch({
-      headless,
-      // Force the FULL chromium build (channel: "chromium") instead of the
-      // chromium_headless_shell. Patchright's stealth depends on the patched
-      // driver plus the full browser; headless-shell is detectable and is a
-      // separate download we intentionally do not install.
-      channel: "chromium",
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      // Headed: never headless-shell. Note we pass headless:false and rely on
+      // Xvfb for the "no display" case.
+      headless: false,
+      channel: "chrome",
+      args: launchArgs,
       env,
       timeout: 90_000,
     })) as unknown as Browser;
   } catch (err) {
     throw new Error(
-      `failed to launch bundled chromium (is it installed? this server does not download browsers): ${
+      `failed to launch Chrome (is it installed? run browser_install_chromium): ${
         (err as Error).message
       }`,
     );
   }
-  return register(browser, "chromium", startUrl, chromiumExecutablePath());
+  const session = await register(browser, "chrome", startUrl, chromiumExecutablePath());
+  session.displayNote = needXvfbRun
+    ? "headed via xvfb-run (no DISPLAY)"
+    : `headed on DISPLAY=${display}`;
+  return session;
 }
 
 /**
@@ -517,13 +495,13 @@ server.registerTool(
   {
     title: "Spawn browser session",
     description:
-      "Launch a browser session. stealth=true (default) uses the camoufox stealth Firefox (full capability: fingerprint config, addons, locale/geoip/humanize); stealth=false uses patchright-driven Chrome.",
+      "Launch a browser session. engine=\"firefox\" (default) uses the camoufox Firefox engine with full anti-fingerprinting capability (config, addons, locale/geoip/humanize). engine=\"chrome\" uses the patchright-driven branded Chrome engine (headed, via Xvfb when no display). Both engines are the stealth-optimized stack — the choice is which browser stack to drive, not stealth on/off.",
     inputSchema: {
       session_id: z.string().optional(),
+      engine: z.enum(["chrome", "firefox"]).optional(),
       headless: z.boolean().optional(),
       start_url: z.string().optional(),
-      stealth: z.boolean().optional(),
-      // camoufox (stealth=true) capability knobs:
+      // firefox (camoufox) capability knobs:
       fingerprint: z.record(z.string(), z.unknown()).optional(),
       geoip: z.union([z.string(), z.boolean()]).optional(),
       locale: z.union([z.string(), z.array(z.string())]).optional(),
@@ -531,23 +509,21 @@ server.registerTool(
       config: z.record(z.string(), z.unknown()).optional(),
     },
   },
-  async ({ headless, start_url, stealth, fingerprint, geoip, locale, humanize, config }) => {
+  async ({ engine, headless, start_url, fingerprint, geoip, locale, humanize, config }) => {
     try {
-      const useStealth = stealth ?? true;
+      const useFirefox = (engine ?? "firefox") === "firefox";
       const camoufoxOptions: CamoufoxSpawnOptions = {};
       if (fingerprint) camoufoxOptions.fingerprint = fingerprint as Record<string, unknown>;
       if (geoip !== undefined) camoufoxOptions.geoip = geoip;
       if (locale !== undefined) camoufoxOptions.locale = locale;
       if (humanize !== undefined) camoufoxOptions.humanize = humanize;
       if (config) camoufoxOptions.config = config as Record<string, unknown>;
-      const session =
-        useStealth === true
-          ? await launchCamoufox(headless ?? true, start_url, camoufoxOptions)
-          : await launchChromium(headless ?? true, start_url);
+      const session = useFirefox
+        ? await launchCamoufox(headless ?? true, start_url, camoufoxOptions)
+        : await launchChromium(headless ?? false, start_url);
       return text({
         session_id: session.id,
         engine: session.engine,
-        headless: headless ?? true,
         url: activePage(session).url(),
         ...(session.displayNote ? { display: session.displayNote } : {}),
         ...(session.addonsLoaded !== undefined ? { addons: session.addonsLoaded } : {}),
@@ -870,9 +846,9 @@ function collectAncestorNodeModules(startDir: string): string[] {
 server.registerTool(
   "browser_install_chromium",
   {
-    title: "Install Chromium for patchright",
+    title: "Install Chrome For Testing for patchright",
     description:
-      "Download the exact Chromium build that this server's patchright (patched Playwright fork) expects — revision read from patchright-core's browsers.json — into the Playwright browsers directory, so browser_spawn with stealth=false works. Installs the FULL chromium build (not chromium_headless_shell, which is detectable). Zero dependencies: ZIP fetched from the Playwright CDN and extracted with Node's zlib.",
+      "Download the exact Chrome For Testing build that this server's patchright (patched Playwright fork) expects — revision read from patchright-core's browsers.json (the \"chromium\" entry IS the Chrome-for-Testing build) — into the Playwright browsers directory, so browser_spawn with engine=\"chrome\" works. Installs the FULL build (never the detectable chromium_headless_shell). Zero dependencies: ZIP fetched from the Playwright CDN and extracted with Node's zlib.",
     inputSchema: {},
   },
   async () => {
@@ -1010,7 +986,16 @@ function describeCamoufoxLayout(dest: string, root: string): {
       break;
     }
   }
-  const addons = addonsDir ? findAddonDirs(addonsDir).map((p) => p.split("/").pop() ?? p) : [];
+  // List immediate subdirectories of addons/ (each is an unpacked addon).
+  const addons = addonsDir
+    ? readdirSync(addonsDir).filter((name) => {
+        try {
+          return statSync(join(addonsDir, name)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+    : [];
   const versionJsonPath = join(dest, "version.json");
   return {
     executable: existsSync(join(dest, "camoufox-bin")),

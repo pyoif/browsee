@@ -1,28 +1,23 @@
 #!/usr/bin/env node
 /**
- * Unit tests for the pure camoufox launcher-assembly functions (dist/camoufox.js).
+ * Unit tests for the camoufox integration layer (dist/camoufox.js).
  *
- * These mirror the official daijro/camoufox launch semantics:
- *   - config → CAMOU_CONFIG_<n> chunked env vars (32767-byte Linux chunks)
- *   - addons passed as config.addons (extracted dirs with manifest.json)
- *   - per-launch seeds gated on the installed build's properties.json
- *   - display planning (DISPLAY reuse / xvfb-run / plain headless)
+ * This layer is a thin adapter over the official `camoufox` npm package
+ * (daijro/camoufox/typescript). We test the parts WE own — option translation,
+ * LD_LIBRARY_PATH assembly, install-dir resolution — not the package's own
+ * fingerprint/config machinery (that has its own bit-exact golden suite).
  *
  * Run: node camoufox.test.mjs   (after `npm run build`).
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { firefox } from "playwright-core";
 import {
-  chunkConfig,
-  firefoxMajorFromRelease,
-  targetOsFromUserAgent,
-  buildCamoufoxConfig,
-  findAddonDirs,
-  loadSupportedProperties,
-  planDisplay,
-  buildCamoufoxPlan,
+  toLaunchOptions,
+  buildLdLibraryPath,
+  gtkLibDir,
+  resolveInstallDir,
+  assembleCamoufoxOptions,
 } from "./dist/camoufox.js";
 
 let passed = 0;
@@ -39,217 +34,142 @@ function test(name, fn) {
   }
 }
 
-const props = new Set([
-  "navigator.userAgent",
-  "navigator.language",
-  "navigator.languages",
-  "headers.Accept-Language",
-  "window.history.length",
-  "fonts:spacing_seed",
-  "audio:seed",
-  "canvas:seed",
-  "canvas:aaOffset",
-  "canvas:aaCapOffset",
-  "webrtc:ipv4",
-  "webrtc:ipv6",
-  "humanize",
-  "humanize:maxTime",
-  "addons",
-]);
+console.log("camoufox integration-layer unit tests\n");
 
-console.log("camoufox launch-assembly unit tests\n");
-
-// --- chunkConfig -----------------------------------------------------------
-test("chunkConfig emits a single CAMOU_CONFIG_1 for small configs", () => {
-  const c = chunkConfig({ a: 1 });
-  assert.deepEqual(Object.keys(c), ["CAMOU_CONFIG_1"]);
-  assert.equal(c.CAMOU_CONFIG_1, '{"a":1}');
+// --- gtkLibDir -------------------------------------------------------------
+test("gtkLibDir points at the pixi env's lib dir", () => {
+  assert.equal(gtkLibDir("/home/u"), "/home/u/camoufox/.pixi/envs/default/lib");
 });
 
-test("chunkConfig splits into sequentially-numbered chunks", () => {
-  const big = { s: "x".repeat(40) };
-  const c = chunkConfig(big, 10);
-  const keys = Object.keys(c);
-  assert.equal(keys[0], "CAMOU_CONFIG_1");
-  assert.equal(keys[1], "CAMOU_CONFIG_2");
-  // Reassembly round-trips.
-  const joined = keys
-    .map((k) => Number(k.split("_").pop()))
-    .sort((a, b) => a - b)
-    .map((n) => c[`CAMOU_CONFIG_${n}`])
-    .join("");
-  assert.deepEqual(JSON.parse(joined), big);
+// --- buildLdLibraryPath ----------------------------------------------------
+test("buildLdLibraryPath orders gtk, browser dir, then existing", () => {
+  assert.equal(buildLdLibraryPath("/gtk", "/bin/dir", "/old"), "/gtk:/bin/dir:/old");
+  assert.equal(buildLdLibraryPath("/gtk", "/bin/dir", ""), "/gtk:/bin/dir");
+  assert.equal(buildLdLibraryPath("/gtk", "/bin/dir", undefined), "/gtk:/bin/dir");
 });
 
-test("chunkConfig always emits at least one chunk", () => {
-  const c = chunkConfig({});
-  assert.deepEqual(Object.keys(c), ["CAMOU_CONFIG_1"]);
-  assert.equal(c.CAMOU_CONFIG_1, "{}");
+// --- toLaunchOptions (option translation) ---------------------------------
+test("toLaunchOptions sets headless, env and i_know_what_im_doing", () => {
+  const lo = toLaunchOptions({}, { headless: true, env: { FOO: "bar" } });
+  assert.equal(lo.headless, true);
+  assert.deepEqual(lo.env, { FOO: "bar" });
+  assert.equal(lo.i_know_what_im_doing, true);
 });
 
-// --- version / OS helpers --------------------------------------------------
-test("firefoxMajorFromRelease extracts the Firefox major", () => {
-  assert.equal(firefoxMajorFromRelease("152.0.4-beta.31"), "152");
-  assert.equal(firefoxMajorFromRelease("135.0"), "135");
-});
-
-test("targetOsFromUserAgent maps UA → OS token", () => {
-  assert.equal(targetOsFromUserAgent("Mozilla/5.0 (Windows NT 10.0)"), "win");
-  assert.equal(targetOsFromUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X)"), "mac");
-  assert.equal(targetOsFromUserAgent("Mozilla/5.0 (X11; Linux x86_64)"), "lin");
-  assert.equal(targetOsFromUserAgent(undefined), "lin");
-});
-
-// --- buildCamoufoxConfig ---------------------------------------------------
-test("config seeds only properties the installed build supports", () => {
-  const c = buildCamoufoxConfig({}, new Set(["audio:seed"]));
-  assert.ok(typeof c["audio:seed"] === "number");
-  assert.ok(c["audio:seed"] >= 1);
-  assert.ok(!("canvas:seed" in c), "canvas:seed not in supported set ⇒ omitted");
-});
-
-test("config includes locale → navigator.language + Accept-Language", () => {
-  const c = buildCamoufoxConfig({ locale: ["en-US", "en"] }, props);
-  assert.equal(c["navigator.language"], "en-US");
-  assert.deepEqual(c["navigator.languages"], ["en-US", "en"]);
-  assert.equal(c["headers.Accept-Language"], "en-US,en;q=0.9");
-});
-
-test("config humanize:true and numeric max-time", () => {
-  const a = buildCamoufoxConfig({ humanize: true }, props);
-  assert.equal(a.humanize, true);
-  const b = buildCamoufoxConfig({ humanize: 250 }, props);
-  assert.equal(b.humanize, true);
-  assert.equal(b["humanize:maxTime"], 250);
-});
-
-test("config geoip literal IPv4 → webrtc:ipv4", () => {
-  const c = buildCamoufoxConfig({ geoip: "203.0.113.7" }, props);
-  assert.equal(c["webrtc:ipv4"], "203.0.113.7");
-});
-
-test("config geoip literal IPv6 → webrtc:ipv6", () => {
-  const c = buildCamoufoxConfig({ geoip: "2001:db8::1" }, props);
-  assert.equal(c["webrtc:ipv6"], "2001:db8::1");
-});
-
-test("explicit config wins over derived defaults", () => {
-  const c = buildCamoufoxConfig(
-    { config: { "canvas:aaOffset": 42, humanize: true }, humanize: true },
-    props,
-  );
-  assert.equal(c["canvas:aaOffset"], 42);
-});
-
-test("fingerprint splats navigator/screen/headers/webGl into config", () => {
-  const c = buildCamoufoxConfig(
-    {},
-    props,
+test("toLaunchOptions maps capability knobs to snake_case keys", () => {
+  const lo = toLaunchOptions(
     {
-      navigator: { userAgent: "Mozilla/5.0 Firefox/150.0", platform: "Win32", hardwareConcurrency: 8 },
-      screen: { width: 1920, height: 1080 },
-      headers: { "Accept-Language": "en-US" },
-      webGl: { vendor: "Intel", renderer: "Intel UHD" },
+      geoip: "203.0.113.7",
+      locale: ["en-US", "en"],
+      humanize: 2,
+      block_images: true,
+      block_webrtc: false,
+      disable_coop: true,
+      addons: ["/a/ubo"],
+      config: { "canvas:seed": 1 },
+      fingerprint: { navigator: {} },
+      os: "linux",
+      firefox_user_prefs: { "network.proxy.type": 0 },
     },
-    "152",
+    { headless: false, env: {} },
   );
-  assert.equal(c["navigator.platform"], "Win32");
-  assert.equal(c["screen.width"], 1920);
-  assert.equal(c["headers.Accept-Language"], "en-US");
-  assert.equal(c["webGl:vendor"], "Intel");
-  // UA major is synced to the installed Firefox version.
-  assert.equal(c["navigator.userAgent"], "Mozilla/5.0 Firefox/152");
+  assert.equal(lo.geoip, "203.0.113.7");
+  assert.deepEqual(lo.locale, ["en-US", "en"]);
+  assert.equal(lo.humanize, 2);
+  assert.equal(lo.block_images, true);
+  assert.equal(lo.block_webrtc, false);
+  assert.equal(lo.disable_coop, true);
+  assert.deepEqual(lo.addons, ["/a/ubo"]);
+  assert.deepEqual(lo.config, { "canvas:seed": 1 });
+  assert.deepEqual(lo.fingerprint, { navigator: {} });
+  assert.equal(lo.os, "linux");
+  assert.deepEqual(lo.firefox_user_prefs, { "network.proxy.type": 0 });
 });
 
-// --- addons ----------------------------------------------------------------
-test("findAddonDirs returns only dirs containing manifest.json", () => {
-  const root = mkdtempSync(join(tmpdir(), "cf-addons-"));
-  try {
-    mkdirSync(join(root, "UBO"));
-    writeFileSync(join(root, "UBO", "manifest.json"), "{}");
-    mkdirSync(join(root, "not-an-addon"));
-    const dirs = findAddonDirs(root);
-    assert.deepEqual(dirs, [join(root, "UBO")]);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
+test("toLaunchOptions omits unset keys (exactOptionalPropertyTypes-safe)", () => {
+  const lo = toLaunchOptions({}, { headless: true, env: {} });
+  for (const k of ["geoip", "locale", "humanize", "fingerprint", "config", "addons"]) {
+    assert.ok(!(k in lo), `${k} should be absent when unset`);
   }
 });
 
-test("findAddonDirs on a missing root returns []", () => {
-  assert.deepEqual(findAddonDirs("/nonexistent/camoufox/addons"), []);
+test("toLaunchOptions only sets executable_path when provided", () => {
+  const a = toLaunchOptions({}, { headless: true, env: {} });
+  assert.ok(!("executable_path" in a), "executable_path absent by default (package resolves its paired build)");
+  const b = toLaunchOptions({}, { headless: true, env: {}, executablePath: "/x/camoufox-bin" });
+  assert.equal(b.executable_path, "/x/camoufox-bin");
 });
 
-// --- properties.json -------------------------------------------------------
-test("loadSupportedProperties reads property names; missing file → empty set", () => {
-  const dir = mkdtempSync(join(tmpdir(), "cf-props-"));
+// --- resolveInstallDir -----------------------------------------------------
+test("resolveInstallDir honors CAMOUFOX_INSTALL_DIR", () => {
+  const r = resolveInstallDir({ CAMOUFOX_INSTALL_DIR: "/custom/camoufox" });
+  assert.equal(r.dir, "/custom/camoufox");
+  // exists flag reflects the actual filesystem (custom path → false here).
+  assert.equal(r.exists, false);
+});
+
+test("resolveInstallDir falls back to the package INSTALL_DIR", () => {
+  const r = resolveInstallDir({});
+  assert.ok(r.dir.length > 0);
+  assert.ok(r.dir.includes("camoufox"));
+});
+
+// --- assembleCamoufoxOptions (async, calls the official launcher) ----------
+const asyncTests = [];
+function testAsync(name, fn) {
+  asyncTests.push([name, fn]);
+}
+
+testAsync("assembleCamoufoxOptions wires LD_LIBRARY_PATH and returns firefox launch options", async () => {
+  const opts = await assembleCamoufoxOptions(
+    { locale: "en-US" },
+    {
+      headless: true,
+      homeDir: "/home/u",
+      processEnv: { PATH: "/usr/bin", LD_LIBRARY_PATH: "/old" },
+      browserDir: "/bin/dir",
+    },
+  );
+  // Everything playwright's firefox() needs must be present.
+  assert.ok("executablePath" in opts, "executablePath set by the package");
+  assert.ok("env" in opts, "env set");
+  assert.equal(opts.env.LD_LIBRARY_PATH, "/home/u/camoufox/.pixi/envs/default/lib:/bin/dir:/old");
+  assert.equal(opts.env.MOZ_HEADLESS, "1");
+  assert.ok(opts.env.CAMOU_CONFIG_1, "chunked CAMOU_CONFIG present");
+  // And the object round-trips as a valid firefox launch options shape.
+  assert.ok(typeof opts.executablePath === "string" && opts.executablePath.length > 0);
+});
+
+testAsync("assembleCamoufoxOptions options are accepted by playwright firefox() validator", async () => {
+  const opts = await assembleCamoufoxOptions(
+    { humanize: true },
+    { headless: true, homeDir: "/home/u", processEnv: {} },
+  );
+  // firefox.launch would reject an invalid options object synchronously; we do
+  // not actually launch (no display in unit tests), we just assert the keys
+  // playwright consumes are present and well-typed.
+  assert.equal(typeof opts.executablePath, "string");
+  assert.equal(typeof opts.firefoxUserPrefs, "object");
+  assert.equal(typeof opts.env, "object");
+  assert.ok(Array.isArray(opts.args));
+});
+
+// Run async tests sequentially, then report.
+for (const [name, fn] of asyncTests) {
   try {
-    writeFileSync(
-      join(dir, "properties.json"),
-      JSON.stringify([{ property: "audio:seed", type: "uint" }, { property: "timezone", type: "str" }]),
-    );
-    const s = loadSupportedProperties(dir);
-    assert.ok(s.has("audio:seed"));
-    assert.ok(s.has("timezone"));
-    assert.equal(s.size, 2);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await fn();
+    passed++;
+    console.log(`  ok   ${name}`);
+  } catch (err) {
+    failed++;
+    console.log(`  FAIL ${name}`);
+    console.log(`       ${err.message}`);
   }
-  assert.equal(loadSupportedProperties("/nonexistent").size, 0);
-});
+}
 
-// --- display planning ------------------------------------------------------
-test("planDisplay reuses an existing DISPLAY (headed, no wrapper)", () => {
-  const p = planDisplay(true, false, ":99");
-  assert.equal(p.headless, false);
-  assert.equal(p.needsXvfbRun, false);
-  assert.equal(p.display, ":99");
-});
-
-test("planDisplay wraps with xvfb-run when no DISPLAY but xvfb present", () => {
-  const p = planDisplay(false, true, undefined);
-  assert.equal(p.headless, false);
-  assert.equal(p.needsXvfbRun, true);
-});
-
-test("planDisplay falls back to plain headless only when explicitly asked", () => {
-  const explicit = planDisplay(true, false, undefined);
-  assert.equal(explicit.headless, true);
-  const notAsked = planDisplay(false, false, undefined);
-  assert.equal(notAsked.headless, true);
-  assert.match(notAsked.note, /ERROR/);
-});
-
-// --- full plan -------------------------------------------------------------
-test("buildCamoufoxPlan wires executable, env chunks, addons and FONTCONFIG", () => {
-  const dir = mkdtempSync(join(tmpdir(), "cf-plan-"));
-  const addonDir = join(dir, "addons", "UBO");
-  try {
-    mkdirSync(join(dir, "fontconfig", "lin"), { recursive: true });
-    mkdirSync(addonDir, { recursive: true });
-    writeFileSync(join(addonDir, "manifest.json"), "{}");
-
-    const plan = buildCamoufoxPlan({
-      installDir: dir,
-      executablePath: join(dir, "camoufox-bin"),
-      properties: props,
-      addons: findAddonDirs(join(dir, "addons")),
-      options: { locale: "en-US" },
-      release: "152.0.4",
-      baseEnv: { LD_LIBRARY_PATH: "/gtk/lib" },
-      targetOs: "lin",
-    });
-
-    assert.equal(plan.executablePath, join(dir, "camoufox-bin"));
-    assert.equal(plan.env.LD_LIBRARY_PATH, "/gtk/lib");
-    assert.equal(plan.env.FONTCONFIG_PATH, join(dir, "fontconfig", "lin"));
-    assert.ok(plan.env.CAMOU_CONFIG_1, "config chunk present");
-    const parsed = JSON.parse(plan.env.CAMOU_CONFIG_1);
-    assert.deepEqual(parsed.addons, [addonDir]);
-    assert.equal(plan.addons.length, 1);
-    assert.equal(plan.firefoxUserPrefs["network.proxy.type"], 0);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+// Sanity: the firefox type we import is the one the server uses.
+test("playwright-core exports firefox()", () => {
+  assert.equal(typeof firefox.launch, "function");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

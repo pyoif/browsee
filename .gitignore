@@ -11,3 +11,4 @@ control_result.json
 __pycache__/
 *.pyc
 /tmp/
+.tmp/
