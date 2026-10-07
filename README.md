@@ -187,22 +187,36 @@ bogus action → browser_kill → browser_list(empty)`.
 
 ## Paths
 
+All of these are resolved relative to the process `HOME`, which is set by the
+MCP **client**, not by browsee. When the client's `HOME` differs from where the
+browser/GTK state was provisioned, the env overrides below are the way to point
+at the right place.
+
 - Project root: `$HOME/browsee`
-- Screenshots: `$HOME/browsee/artifacts/`
+- Screenshots: `$BROWSEE_ARTIFACTS_DIR` or `$HOME/browsee/artifacts/`
+  (⚠️ point this into the caller's workspace when `HOME` is a path the caller
+  cannot read — e.g. a daemon that runs its MCP children with `HOME=/data`.)
 - Camoufox install: package-managed (official `camoufox` launcher) or
   `$CAMOUFOX_INSTALL_DIR` / `$HOME/.cache/camoufox/`
 - Chrome (patchright): `$PLAYWRIGHT_BROWSERS_PATH` or `$HOME/.cache/ms-playwright/`
-- GTK libs: `$HOME/camoufox/.pixi/envs/default/lib`
+- GTK libs: `$BROWSEE_GTK_LIB_DIR`, else the first of
+  `$HOME/camoufox/.pixi/envs/default/lib`, `$PWD/camoufox/.pixi/envs/default/lib`,
+  `/usr/lib`, `/lib` that actually contains `libgtk-3.so.0`
 - libudev shim: `$HOME/.local/lib/udev` (Chrome links `libudev.so.1`, absent from
   some minimal images such as Wolfi)
 
 ## Note on `LD_LIBRARY_PATH`
 
-`run.sh` prepends `$HOME/.local/lib/udev` and the pixi GTK lib dir to
+`run.sh` prepends `$HOME/.local/lib/udev` and a resolved GTK lib dir to
 `LD_LIBRARY_PATH` so:
 1. Node (fetched by nub) finds `libatomic`;
 2. Camoufox's Firefox finds `libgtk-3`/X11 libs;
 3. Chrome finds `libudev.so.1`.
+
+The GTK dir is picked from the same candidate list the server uses
+(`BROWSEE_GTK_LIB_DIR` → `$HOME` pixi env → `$PWD` pixi env → `/usr/lib` → `/lib`),
+so a `HOME` mismatch between the client and the provisioning location no longer
+breaks the launch.
 
 The server also self-heals for (3): the Chrome launch path scans for a
 `libudev.so.1` provider on disk and appends it to the child's `LD_LIBRARY_PATH`,
@@ -210,6 +224,11 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.3** — resolve the GTK/X11 lib dir across candidates instead of a single
+  `$HOME` prefix, so camoufox launches when the MCP client passes a `HOME`
+  (`/data`) different from where the pixi env was provisioned. Screenshot dir is
+  now overridable via `BROWSEE_ARTIFACTS_DIR` for the same reason (artifacts were
+  landing outside the caller's readable workspace).
 - **v0.3.2** — the chrome engine's "no display" path now **actually provides** a
   display instead of only reporting one. Previously `needXvfbRun` was set and
   surfaced as `displayNote` ("headed via xvfb-run (no DISPLAY)") but was never

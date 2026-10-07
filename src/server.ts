@@ -52,7 +52,9 @@ import { downloadToBuffer, downloadText, logStderr } from "./download.js";
 import {
   assembleCamoufoxOptions,
   isOnPath,
+  resolveGtkLibDir,
   resolveInstallDir,
+  hasGtkLib,
   type CamoufoxSpawnOptions,
 } from "./camoufox.js";
 
@@ -62,11 +64,28 @@ import {
 
 const HOME = homedir();
 const PROJECT_ROOT = join(HOME, "browsee");
-const ARTIFACTS_DIR = join(PROJECT_ROOT, "artifacts");
+
+/**
+ * Where screenshots are written.
+ *
+ * Overridable via `BROWSEE_ARTIFACTS_DIR`. This matters because the MCP child's
+ * HOME is set by the *client* (spacebot uses `HOME=/data`), so the default
+ * `$HOME/browsee/artifacts` can land outside the agent's workspace, where the
+ * caller then cannot read the screenshot it just asked for. Point this at a
+ * workspace-visible directory when that happens.
+ */
+const ARTIFACTS_DIR =
+  process.env.BROWSEE_ARTIFACTS_DIR && process.env.BROWSEE_ARTIFACTS_DIR.trim() !== ""
+    ? process.env.BROWSEE_ARTIFACTS_DIR
+    : join(PROJECT_ROOT, "artifacts");
 mkdirSync(ARTIFACTS_DIR, { recursive: true });
 
-/** GTK/X11 libs shipped by the pixi env, needed by camoufox's Firefox build. */
-const GTK_LIB_DIR = join(HOME, "camoufox", ".pixi", "envs", "default", "lib");
+/**
+ * GTK/X11 libs needed by camoufox's Firefox build. Resolved across candidates
+ * (env override, `$HOME`, cwd, system) because the pixi env and the process
+ * HOME can disagree — see `resolveGtkLibDir`.
+ */
+const GTK_LIB_DIR = resolveGtkLibDir(HOME);
 
 /** Return the tag/dir/bin of an existing camoufox build under `root`, if any. */
 function findExistingCamoufox(root: string): { tag: string; dir: string; bin: string } | null {
@@ -192,9 +211,11 @@ async function launchCamoufox(
   startUrl: string | undefined,
   options: CamoufoxSpawnOptions = {},
 ): Promise<Session> {
-  if (!existsSync(GTK_LIB_DIR)) {
+  if (!hasGtkLib(GTK_LIB_DIR)) {
     throw new Error(
-      `GTK lib dir not found at ${GTK_LIB_DIR} — the pixi env providing libgtk-3 is missing`,
+      `GTK lib dir not found at ${GTK_LIB_DIR} — no libgtk-3.so.0 there. ` +
+        `Set BROWSEE_GTK_LIB_DIR to a directory that provides it (e.g. the pixi env), ` +
+        `or install libgtk-3 system-wide.`,
     );
   }
 
@@ -242,17 +263,13 @@ async function launchChromium(
   headless: boolean,
   startUrl: string | undefined,
 ): Promise<Session> {
-  // The Wolfi runtime image ships most of chromium's shared libs, but a few
-  // can be absent (e.g. libudev.so.1). Playwright's chromium looks for them via
-  // the dynamic loader; we extend LD_LIBRARY_PATH with any browser-support lib
-  // directories present on disk so the launch works in a slim image without
-  // requiring the caller to set the env var. No-op when the libs already load.
+  // The Wolfi runtime image ships chromium's shared libs (including libudev.so.1
+  // and the GTK/X11 stack), so the browser finds them via the normal dynamic
+  // loader and no LD_LIBRARY_PATH shim is needed. (Earlier images lacked
+  // libudev.so.1, and a workspace-local shim was prepended here; that workaround
+  // was removed once the image baked the libraries in — see run.sh and the
+  // container commits 368ec8fc/ad8592b5/c1d62c46.)
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
-  const extraLibDirs = findBrowserSupportLibDirs();
-  if (extraLibDirs.length > 0) {
-    const existing = env.LD_LIBRARY_PATH ? `:${env.LD_LIBRARY_PATH}` : "";
-    env.LD_LIBRARY_PATH = `${extraLibDirs.join(":")}${existing}`;
-  }
 
   // Headed is required for stealth fidelity: patchright's patches only hold in
   // a real (non-headless-shell) browser. On a server with no display we must
@@ -443,34 +460,6 @@ async function startXvfb(): Promise<XvfbHandle> {
   throw new Error(
     "Chrome engine: could not start Xvfb — no free display number found in :99..:129.",
   );
-}
-
-/**
- * Directories that should be appended to LD_LIBRARY_PATH for chromium. We scan
- * a small set of workspace-local locations (the same places the container's
- * other toolchains keep their libs) for libudev.so.1, which is the one commonly
- * missing from slim images. Returns dirs in priority order, deduped.
- */
-function findBrowserSupportLibDirs(): string[] {
-  const dirs: string[] = [];
-  const candidates = [
-    join(HOME, ".local", "lib", "udev"),
-    join(HOME, "camoufox", ".pixi", "envs", "default", "lib"),
-    "/usr/lib",
-    "/lib",
-  ];
-  for (const dir of candidates) {
-    try {
-      if (!existsSync(dir)) continue;
-      const entries = readdirSync(dir);
-      if (entries.some((e) => e.startsWith("libudev.so"))) {
-        if (!dirs.includes(dir)) dirs.push(dir);
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  return dirs;
 }
 
 /** Resolve the chromium executable path patchright will use, best-effort. */

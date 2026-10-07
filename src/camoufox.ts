@@ -55,9 +55,60 @@ export interface CamoufoxSpawnOptions {
   firefox_user_prefs?: Record<string, unknown>;
 }
 
-/** The GTK/X11 lib dir provided by the pixi env (see run.sh / README). */
-export function gtkLibDir(homeDir: string): string {
-  return join(homeDir, "camoufox", ".pixi", "envs", "default", "lib");
+/**
+ * Candidate GTK/X11 lib dirs for a camoufox launch, in priority order.
+ *
+ * The primary location is the pixi env under the process HOME
+ * (`$HOME/camoufox/.pixi/envs/default/lib`), which is what `run.sh` and the
+ * README wire up. But the MCP child's HOME is whatever the *client* passes
+ * (spacebot sets `HOME=/data`), while the pixi env may have been provisioned
+ * under a different HOME (e.g. the agent workspace). Hard-requiring a single
+ * `$HOME` prefix made the launcher fail even though a perfectly good GTK was on
+ * disk one directory over. So we accept, in order:
+ *
+ *   1. `BROWSEE_GTK_LIB_DIR` — explicit override.
+ *   2. `$HOME/camoufox/.pixi/envs/default/lib` — the documented location.
+ *   3. `<cwd>/camoufox/.pixi/envs/default/lib` — workspace-local provisioning.
+ *   4. `/usr/lib`, `/lib` — a distro/Wolfi image that ships libgtk-3 itself.
+ *
+ * The first candidate that actually contains `libgtk-3.so.0` wins; the list is
+ * returned so the caller can also fold it into LD_LIBRARY_PATH.
+ */
+export function gtkLibDirCandidates(
+  homeDir: string,
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const dirs: string[] = [];
+  const push = (d: string | undefined): void => {
+    if (d && d.trim() !== "" && !dirs.includes(d)) dirs.push(d);
+  };
+  push(env.BROWSEE_GTK_LIB_DIR);
+  push(join(homeDir, "camoufox", ".pixi", "envs", "default", "lib"));
+  push(join(process.cwd(), "camoufox", ".pixi", "envs", "default", "lib"));
+  push("/usr/lib");
+  push("/lib");
+  return dirs;
+}
+
+/** Whether `dir` contains a usable libgtk-3 shared object. */
+export function hasGtkLib(dir: string): boolean {
+  try {
+    return existsSync(join(dir, "libgtk-3.so.0")) || existsSync(join(dir, "libgtk-3.so"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the best GTK lib dir for this launch, or the first candidate when
+ * none of them has libgtk-3 (so the caller can report a useful path).
+ */
+export function resolveGtkLibDir(
+  homeDir: string,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const candidates = gtkLibDirCandidates(homeDir, env);
+  return candidates.find(hasGtkLib) ?? candidates[0] ?? "/usr/lib";
 }
 
 /**
@@ -73,12 +124,21 @@ export function isOnPath(name: string, env: NodeJS.ProcessEnv = process.env): bo
 }
 
 /**
- * Build the LD_LIBRARY_PATH for a camoufox launch: the pixi GTK lib dir first,
- * then the browser's own directory (bundled libxul/libnss), then whatever the
- * caller already had. Mirrors the env the previous hand-rolled launcher set.
+ * Build the LD_LIBRARY_PATH for a camoufox launch: the resolved GTK lib dir
+ * first, then the browser's own directory (bundled libxul/libnss), then
+ * whatever the caller already had. Accepts several GTK candidate dirs so the
+ * launcher keeps working whether GTK comes from the pixi env or the system.
  */
-export function buildLdLibraryPath(gtkDir: string, browserDir: string, existing?: string): string {
-  const base = `${gtkDir}:${browserDir}`;
+export function buildLdLibraryPath(
+  gtkDirs: string | string[],
+  browserDir: string,
+  existing?: string,
+): string {
+  const dirs = (Array.isArray(gtkDirs) ? gtkDirs : [gtkDirs]).filter(
+    (d): d is string => typeof d === "string" && d.trim() !== "",
+  );
+  if (browserDir && browserDir.trim() !== "") dirs.push(browserDir);
+  const base = dirs.join(":");
   return existing && existing.trim() !== "" ? `${base}:${existing}` : base;
 }
 
@@ -150,7 +210,7 @@ export async function assembleCamoufoxOptions(
     browserDir?: string | undefined;
   },
 ): Promise<Record<string, unknown>> {
-  const gtkDir = gtkLibDir(ctx.homeDir);
+  const gtkDir = resolveGtkLibDir(ctx.homeDir, ctx.processEnv);
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(ctx.processEnv)) {
     if (typeof v === "string") env[k] = v;

@@ -12,7 +12,23 @@
 # launched by the server inherits it. See notes/chromium-playwright-install.md.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-GTK_LIB="$HOME/camoufox/.pixi/envs/default/lib"
+# GTK/X11 libs: prefer the documented pixi env under $HOME, but fall back to a
+# workspace-local pixi env and then the system, so the server still starts when
+# the client passes a different HOME than the one the env was provisioned under.
+GTK_CANDIDATES=(
+  "${BROWSEE_GTK_LIB_DIR:-}"
+  "$HOME/camoufox/.pixi/envs/default/lib"
+  "$PWD/camoufox/.pixi/envs/default/lib"
+  "/usr/lib"
+  "/lib"
+)
+GTK_LIB=""
+for cand in "${GTK_CANDIDATES[@]}"; do
+  if [ -n "$cand" ] && [ -e "$cand/libgtk-3.so.0" ]; then
+    GTK_LIB="$cand"
+    break
+  fi
+done
 UDEV_LIB="$HOME/.local/lib/udev"
 export LD_LIBRARY_PATH="${UDEV_LIB}:${GTK_LIB}:${LD_LIBRARY_PATH:-}"
 exec nub "$HERE/dist/server.js"
