@@ -19,6 +19,7 @@ import {
   hasGtkLib,
   resolveInstallDir,
   assembleCamoufoxOptions,
+  resolveStorageStatePath,
 } from "./dist/camoufox.js";
 
 let passed = 0;
@@ -183,6 +184,57 @@ testAsync("assembleCamoufoxOptions options are accepted by playwright firefox() 
   assert.equal(typeof opts.env, "object");
   assert.ok(Array.isArray(opts.args));
 });
+
+// --- resolveStorageStatePath (browser_spawn storage_state validation) ------
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pjoin } from "node:path";
+
+const ssDir = mkdtempSync(pjoin(tmpdir(), "browsee-ss-"));
+const artifactsDir = pjoin(ssDir, "artifacts");
+import { mkdirSync as mkdirSyncFs } from "node:fs";
+mkdirSyncFs(artifactsDir, { recursive: true });
+
+test("resolveStorageStatePath rejects an empty path", () => {
+  assert.throws(() => resolveStorageStatePath("", artifactsDir), /non-empty/);
+});
+
+test("resolveStorageStatePath throws clearly when the file is missing", () => {
+  assert.throws(
+    () => resolveStorageStatePath("nope.json", artifactsDir),
+    /does not exist/,
+  );
+});
+
+test("resolveStorageStatePath resolves a relative path against BROWSEE_ARTIFACTS_DIR", () => {
+  const p = pjoin(artifactsDir, "state.json");
+  writeFileSync(p, JSON.stringify({ cookies: [], origins: [] }));
+  assert.equal(resolveStorageStatePath("state.json", artifactsDir), p);
+});
+
+test("resolveStorageStatePath accepts an absolute path", () => {
+  const p = pjoin(ssDir, "abs.json");
+  writeFileSync(p, JSON.stringify({ cookies: [{ name: "a" }], origins: [] }));
+  assert.equal(resolveStorageStatePath(p, artifactsDir), p);
+});
+
+test("resolveStorageStatePath rejects malformed JSON", () => {
+  const p = pjoin(artifactsDir, "bad.json");
+  writeFileSync(p, "{ not json ");
+  assert.throws(() => resolveStorageStatePath("bad.json", artifactsDir), /not valid JSON/);
+});
+
+test("resolveStorageStatePath rejects JSON without a cookies array", () => {
+  const p = pjoin(artifactsDir, "shape.json");
+  writeFileSync(p, JSON.stringify({ origins: [] }));
+  assert.throws(() => resolveStorageStatePath("shape.json", artifactsDir), /no "cookies" array/);
+});
+
+try {
+  rmSync(ssDir, { recursive: true, force: true });
+} catch {
+  /* best-effort cleanup */
+}
 
 // Run async tests sequentially, then report.
 for (const [name, fn] of asyncTests) {

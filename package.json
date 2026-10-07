@@ -1,6 +1,6 @@
 {
   "name": "browsee",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "type": "module",
   "packageManager": "nub@0.9.5",
   "devEngines": {
@@ -17,7 +17,9 @@
     "build": "tsc -p tsconfig.build.json",
     "prepare": "nub exec tsc -p tsconfig.build.json",
     "start": "bash run.sh",
-    "e2e": "node e2e-test.mjs"
+    "e2e": "node e2e-test.mjs",
+    "test:unit": "node camoufox.test.mjs",
+    "test:storage-state": "node storage-state.e2e.mjs"
   },
   "devDependencies": {
     "@nubjs/types": ">=0.4.13 <=0.9.5",

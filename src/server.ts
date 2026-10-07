@@ -54,6 +54,7 @@ import {
   isOnPath,
   resolveGtkLibDir,
   resolveInstallDir,
+  resolveStorageStatePath as resolveStorageStatePathPure,
   hasGtkLib,
   type CamoufoxSpawnOptions,
 } from "./camoufox.js";
@@ -79,6 +80,16 @@ const ARTIFACTS_DIR =
     ? process.env.BROWSEE_ARTIFACTS_DIR
     : join(PROJECT_ROOT, "artifacts");
 mkdirSync(ARTIFACTS_DIR, { recursive: true });
+
+/**
+ * Resolve and validate a storage-state path passed to `browser_spawn`.
+ *
+ * Thin wrapper: the validation logic lives in `camoufox.ts` as a pure,
+ * unit-tested function; here we bind it to this server's `ARTIFACTS_DIR`.
+ */
+function resolveStorageStatePath(input: string): string {
+  return resolveStorageStatePathPure(input, ARTIFACTS_DIR);
+}
 
 /**
  * GTK/X11 libs needed by camoufox's Firefox build. Resolved across candidates
@@ -210,6 +221,7 @@ async function launchCamoufox(
   headless: boolean,
   startUrl: string | undefined,
   options: CamoufoxSpawnOptions = {},
+  storageState: string | null = null,
 ): Promise<Session> {
   if (!hasGtkLib(GTK_LIB_DIR)) {
     throw new Error(
@@ -245,7 +257,7 @@ async function launchCamoufox(
     timeout: 90_000,
   } as Parameters<typeof playwrightFirefox.launch>[0])) as unknown as Browser;
 
-  const session = await register(browser, "firefox", startUrl, bin ?? null);
+  const session = await register(browser, "firefox", startUrl, bin ?? null, storageState);
   const cfgAddons = (launchOpts as { env?: Record<string, string> }).env?.CAMOU_CONFIG_1;
   session.displayNote = process.env.DISPLAY ? `DISPLAY=${process.env.DISPLAY}` : "headless (no display)";
   if (cfgAddons) {
@@ -262,6 +274,7 @@ async function launchCamoufox(
 async function launchChromium(
   headless: boolean,
   startUrl: string | undefined,
+  storageState: string | null = null,
 ): Promise<Session> {
   // The Wolfi runtime image ships chromium's shared libs (including libudev.so.1
   // and the GTK/X11 stack), so the browser finds them via the normal dynamic
@@ -352,7 +365,7 @@ async function launchChromium(
       }`,
     );
   }
-  const session = await register(browser, "chrome", startUrl, executablePath);
+  const session = await register(browser, "chrome", startUrl, executablePath, storageState);
   if (xvfb) session.xvfb = xvfb;
   session.displayNote = displayNote;
   return session;
@@ -524,8 +537,13 @@ async function register(
   engine: Engine,
   startUrl: string | undefined,
   executableHint: string | null,
+  storageState: string | null,
 ): Promise<Session> {
-  const context = await browser.newContext();
+  // Restore cookies + per-origin localStorage at context creation when a
+  // storage_state path was supplied. Passing it here (rather than re-injecting
+  // after the fact) is the only way to restore localStorage, since
+  // context.addCookies() — used by browser_cookies mode=load — cannot.
+  const context = await browser.newContext(storageState ? { storageState } : {});
   const page = await context.newPage();
   // Playwright (patchright) Browser has no process() accessor; find the browser
   // OS process by matching the launched executable in /proc (best-effort).
@@ -700,6 +718,10 @@ server.registerTool(
       engine: z.enum(["chrome", "firefox"]).optional(),
       headless: z.boolean().optional(),
       start_url: z.string().optional(),
+      // Full storage-state restore at context creation (cookies + per-origin
+      // localStorage). Path to a JSON written by `browser_cookies mode=save`;
+      // relative paths resolve against BROWSEE_ARTIFACTS_DIR.
+      storage_state: z.string().optional(),
       // firefox (camoufox) capability knobs:
       fingerprint: z.record(z.string(), z.unknown()).optional(),
       geoip: z.union([z.string(), z.boolean()]).optional(),
@@ -708,9 +730,10 @@ server.registerTool(
       config: z.record(z.string(), z.unknown()).optional(),
     },
   },
-  async ({ engine, headless, start_url, fingerprint, geoip, locale, humanize, config }) => {
+  async ({ engine, headless, start_url, storage_state, fingerprint, geoip, locale, humanize, config }) => {
     try {
       const useFirefox = (engine ?? "firefox") === "firefox";
+      const storageStatePath = storage_state ? resolveStorageStatePath(storage_state) : null;
       const camoufoxOptions: CamoufoxSpawnOptions = {};
       if (fingerprint) camoufoxOptions.fingerprint = fingerprint as Record<string, unknown>;
       if (geoip !== undefined) camoufoxOptions.geoip = geoip;
@@ -718,12 +741,13 @@ server.registerTool(
       if (humanize !== undefined) camoufoxOptions.humanize = humanize;
       if (config) camoufoxOptions.config = config as Record<string, unknown>;
       const session = useFirefox
-        ? await launchCamoufox(headless ?? true, start_url, camoufoxOptions)
-        : await launchChromium(headless ?? false, start_url);
+        ? await launchCamoufox(headless ?? true, start_url, camoufoxOptions, storageStatePath)
+        : await launchChromium(headless ?? false, start_url, storageStatePath);
       return text({
         session_id: session.id,
         engine: session.engine,
         url: activePage(session).url(),
+        ...(storageStatePath ? { storage_state: storageStatePath } : {}),
         ...(session.displayNote ? { display: session.displayNote } : {}),
         ...(session.addonsLoaded !== undefined ? { addons: session.addonsLoaded } : {}),
       });
@@ -798,7 +822,7 @@ server.registerTool(
   {
     title: "Browser cookies / storage state",
     description:
-      "mode=get returns cookies; mode=save writes a full storage-state JSON to path; mode=load loads storage state from path into the context.",
+      "Storage-state tool. mode=get returns cookies; mode=save writes a FULL storage-state JSON (cookies + per-origin localStorage) to path; mode=load re-injects COOKIES ONLY into the live context (localStorage is NOT restored by load). For a full save→restore round-trip including localStorage, save here then spawn a new session with browser_spawn's storage_state=<path> — restore happens at context creation, which is the only point localStorage can be seeded.",
     inputSchema: {
       session_id: z.string(),
       mode: z.enum(["get", "save", "load"]),

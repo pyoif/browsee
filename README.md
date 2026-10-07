@@ -74,6 +74,7 @@ Launch a session.
 | `engine` | `"chrome" \| "firefox"` | `"firefox"` | which browser stack to drive |
 | `headless` | boolean | `true` (firefox) / `false` (chrome) | firefox: honoured; chrome: always headed regardless (virtual display used when no `DISPLAY`) |
 | `start_url` | string | — | navigate here on spawn |
+| `storage_state` | string | — | path to a storage-state JSON written by `browser_cookies mode=save`; relative paths resolve against `BROWSEE_ARTIFACTS_DIR`. Restores cookies **and per-origin localStorage** at context creation (both engines). |
 | `fingerprint` | object | — | *firefox* — `fingerprint` config passed to the camoufox launcher |
 | `geoip` | string \| boolean | — | *firefox* — GeoIP spoofing (e.g. `"auto"` or a country code) |
 | `locale` | string \| string[] | — | *firefox* — locale(s) to present |
@@ -81,10 +82,14 @@ Launch a session.
 | `config` | object | — | *firefox* — additional raw CAMOU config entries |
 
 Returns `{ session_id, engine, headless, url }` (plus a display note when the
-engine had to fall back to a virtual display).
+engine had to fall back to a virtual display, and the echoed `storage_state`
+path when one was supplied).
 
 The four firefox-only params map directly onto the official camoufox launcher's
-options; on the `chrome` engine they are ignored.
+options; on the `chrome` engine they are ignored. `storage_state` applies to both
+engines and is validated up front — a missing file, malformed JSON, or a JSON
+object without a `cookies` array fails the spawn with a clear error rather than
+silently starting a fresh, logged-out context.
 
 ### `browser_kill`
 `{ session_id }` → closes the context + browser and removes it from the registry.
@@ -117,7 +122,24 @@ An unknown action returns an `isError` result — the server never crashes.
 |---|---|
 | `get` | `{ count, cookies }` from the live context |
 | `save` | writes a full storage-state JSON to `path`; returns `{ ok, path, cookies, origins }` |
-| `load` | reads storage state from `path` and adds its cookies to the context |
+| `load` | reads storage state from `path` and adds **its cookies only** to the live context |
+
+`save` captures the full Playwright storage state — cookies plus per-origin
+localStorage. `load` is deliberately cookies-only (it calls
+`context.addCookies`), because localStorage can only be seeded when a context is
+created. For a full save → restore round-trip, including localStorage, save with
+this tool and then spawn a new session with `browser_spawn`'s `storage_state`
+argument pointing at the saved file:
+
+```
+browser_cookies { session_id, mode: "save", path: "state.json" }
+browser_kill    { session_id }
+browser_spawn   { engine: "firefox", storage_state: "state.json" }
+```
+
+The restored context comes back with the same cookies and per-origin
+localStorage as the saved session. `sessionStorage` is not captured by either
+path — Playwright's storage-state format excludes it.
 
 ### Tab management
 
@@ -188,6 +210,12 @@ the official `camoufox` package can fetch/manage its own install.
 navigate → evaluate(title) → cookies save → screenshot → browser_list →
 bogus action → browser_kill → browser_list(empty)`.
 
+`node storage-state.e2e.mjs` covers the storage-state round-trip on the firefox
+engine: spawn → set localStorage/cookie on a real origin → `save` → kill →
+respawn with `storage_state` → assert localStorage and cookie are restored.
+Unit tests (`node camoufox.test.mjs`) include the six `resolveStorageStatePath`
+validation cases.
+
 ## Paths
 
 All of these are resolved relative to the process `HOME`, which is set by the
@@ -227,6 +255,12 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.4** — `browser_spawn` gains `storage_state`, restoring the full saved
+  storage state (cookies **and** per-origin localStorage) at context creation for
+  both engines. `browser_cookies mode=load` remains cookies-only (localStorage can
+  only be seeded at context creation), so the full round-trip is save → respawn
+  with `storage_state`. Path is validated up front (exists, parses, has a
+  `cookies` array); relative paths resolve against `BROWSEE_ARTIFACTS_DIR`.
 - **v0.3.3** — resolve the GTK/X11 lib dir across candidates instead of a single
   `$HOME` prefix, so camoufox launches when the MCP client passes a `HOME`
   (`/data`) different from where the pixi env was provisioned. Screenshot dir is

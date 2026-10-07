@@ -22,8 +22,8 @@
  * be unit-tested without launching a browser.
  */
 
-import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   launchOptions as camoufoxLaunchOptions,
   INSTALL_DIR,
@@ -122,6 +122,48 @@ export function isOnPath(name: string, env: NodeJS.ProcessEnv = process.env): bo
     if (dir && existsSync(join(dir, name))) return true;
   }
   return false;
+}
+
+/**
+ * Resolve and validate a storage-state path for `browser_spawn`'s
+ * `storage_state` parameter.
+ *
+ * Relative paths resolve against `artifactsDir` (that is where
+ * `browser_cookies mode=save` writes, so a save→spawn round-trip can pass the
+ * same bare filename). The file MUST exist and MUST parse as JSON with a
+ * `cookies` array — the Playwright storage-state shape. We fail loudly rather
+ * than silently spawning a fresh (logged-out) context, because a silent
+ * fallback would look like "restore worked" while dropping the session.
+ *
+ * Pure except for the filesystem reads; `artifactsDir` is a parameter so this is
+ * unit-testable without the server's module-level environment.
+ */
+export function resolveStorageStatePath(input: string, artifactsDir: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "") throw new Error("storage_state must be a non-empty path");
+  const abs = isAbsolute(trimmed) ? trimmed : resolve(artifactsDir, trimmed);
+  if (!existsSync(abs)) {
+    throw new Error(
+      `storage_state file does not exist: ${abs}` +
+        (isAbsolute(trimmed) ? "" : ` (resolved relative to BROWSEE_ARTIFACTS_DIR=${artifactsDir})`),
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(abs, "utf8"));
+  } catch (err) {
+    throw new Error(`storage_state file is not valid JSON: ${abs} (${(err as Error).message})`);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !Array.isArray((parsed as { cookies?: unknown }).cookies)
+  ) {
+    throw new Error(
+      `storage_state file has no "cookies" array (not a Playwright storage-state file): ${abs}`,
+    );
+  }
+  return abs;
 }
 
 /**
