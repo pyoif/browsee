@@ -11,8 +11,9 @@
  * did), we depend on the package and keep only the bits specific to running it
  * inside this server's container:
  *
- *   1. GTK/X11 libs — the Wolfi image has no system libgtk-3, so we point
- *      LD_LIBRARY_PATH at the pixi env that provides it + the browser's own dir.
+ *   1. GTK/X11 libs — the launch needs libgtk-3 on LD_LIBRARY_PATH; we resolve
+ *      the dir across an env override / pixi env / the system image and pass it
+ *      through to the browser's own dir.
  *   2. The API surface browser_spawn exposes (engine: "firefox" + capability
  *      knobs) → the package's snake_case launchOptions() options.
  *   3. Headed/headless plumbing for a display-less server.

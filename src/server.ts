@@ -5,8 +5,8 @@
  * Engines (browser_spawn takes engine: "firefox" | "chrome"):
  *   - "firefox" (default): the camoufox Firefox engine — full anti-fingerprint
  *     capability (config/fingerprint/addons/locale/geoip/humanize). Launched
- *     with LD_LIBRARY_PATH pointed at the pixi GTK env so the build finds
- *     libgtk-3 etc., and driven by vanilla playwright-core's firefox() —
+ *     with LD_LIBRARY_PATH pointed at the resolved GTK lib dir so the build
+ *     finds libgtk-3 etc., and driven by vanilla playwright-core's firefox() —
  *     patchright's patched firefox driver is NOT compatible with camoufox's
  *     patched juggler (page.evaluate breaks).
  *   - "chrome": branded Chrome For Testing driven by PATCHRIGHT (the patched,
@@ -199,8 +199,8 @@ function findBrowserPid(exePath: string): number | null {
  * `camoufox` package (daijro/camoufox/typescript). The package owns fingerprint
  * generation, CAMOU_CONFIG/CAMOU_PREFS assembly, addons, fonts, GeoIP, locale,
  * humanize and virtual display. We only add container plumbing: the GTK/X11
- * LD_LIBRARY_PATH (no system libgtk-3 in the Wolfi image) and the translation
- * of browser_spawn's capability knobs into launchOptions().
+ * LD_LIBRARY_PATH (resolved across env override / pixi env / system) and the
+ * translation of browser_spawn's capability knobs into launchOptions().
  *
  * camoufox is a Firefox build, so it is driven by vanilla playwright-core's
  * firefox() — patchright's patched firefox driver is incompatible with
@@ -655,7 +655,24 @@ async function runAction(
 // MCP server
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "browsee", version: "0.3.0" });
+/**
+ * Report the same version as package.json so the two can never drift (the
+ * literal here was previously hardcoded and lagged the package at 0.3.0 through
+ * three releases). Anchored on this module's own directory (dist/.. == repo
+ * root), with a safe fallback if package.json is unreadable.
+ */
+function resolveServerVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    if (typeof pkg.version === "string" && pkg.version.trim() !== "") return pkg.version;
+  } catch {
+    /* fall through to the compiled-in fallback */
+  }
+  return "0.3.3";
+}
+
+const server = new McpServer({ name: "browsee", version: resolveServerVersion() });
 
 function text(value: unknown) {
   return {

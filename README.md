@@ -50,13 +50,16 @@ nub exec tsc -p tsconfig.build.json   # build -> dist/server.js
 The server speaks JSON-RPC over **stdin/stdout**. Launch it with:
 
 ```sh
-./run.sh            # wraps: LD_LIBRARY_PATH=<pixi GTK lib>:… nub dist/server.js
+./run.sh            # wraps: LD_LIBRARY_PATH=<resolved GTK lib>:… nub dist/server.js
 ```
 
-`run.sh` sets `LD_LIBRARY_PATH` so (a) Node can find `libatomic` and (b) the
-Camoufox Firefox binary can find `libgtk-3`/X11 libs. Wire it into an MCP client
-by pointing the client's `command` at `run.sh` (or directly at
-`nub dist/server.js` with `LD_LIBRARY_PATH` exported).
+`run.sh` sets `LD_LIBRARY_PATH` to the resolved GTK/X11 lib dir so the Camoufox
+Firefox binary can find `libgtk-3` and friends. Wire it into an MCP client by
+pointing the client's `command` at `run.sh` (or directly at
+`nub dist/server.js` with `LD_LIBRARY_PATH` exported). The spacebotX Wolfi image
+ships the GTK/X11 stack, `libudev`, `libatomic` and Xvfb natively, so no library
+shim is needed; on other images `libgtk-3` may still need to come from a pixi
+env (see `BROWSEE_GTK_LIB_DIR`).
 
 ## Tools
 
@@ -202,16 +205,16 @@ at the right place.
 - GTK libs: `$BROWSEE_GTK_LIB_DIR`, else the first of
   `$HOME/camoufox/.pixi/envs/default/lib`, `$PWD/camoufox/.pixi/envs/default/lib`,
   `/usr/lib`, `/lib` that actually contains `libgtk-3.so.0`
-- libudev shim: `$HOME/.local/lib/udev` (Chrome links `libudev.so.1`, absent from
-  some minimal images such as Wolfi)
 
 ## Note on `LD_LIBRARY_PATH`
 
-`run.sh` prepends `$HOME/.local/lib/udev` and a resolved GTK lib dir to
-`LD_LIBRARY_PATH` so:
-1. Node (fetched by nub) finds `libatomic`;
-2. Camoufox's Firefox finds `libgtk-3`/X11 libs;
-3. Chrome finds `libudev.so.1`.
+`run.sh` prepends a resolved GTK lib dir to `LD_LIBRARY_PATH` so Camoufox's
+Firefox finds `libgtk-3`/X11 libs. Earlier images also required a `libudev.so.1`
+shim (Chromium links it and Wolfi did not ship it) plus the pixi env for
+`libatomic`; the spacebotX Wolfi image now bakes the GTK stack, `libudev` and
+`libatomic` in (container commits 368ec8fc/ad8592b5/c1d62c46), so that shim and
+its `LD_LIBRARY_PATH` entry have been removed. Any stale
+`$HOME/.local/lib/udev/libudev.so.1` left on disk is now inert.
 
 The GTK dir is picked from the same candidate list the server uses
 (`BROWSEE_GTK_LIB_DIR` → `$HOME` pixi env → `$PWD` pixi env → `/usr/lib` → `/lib`),
