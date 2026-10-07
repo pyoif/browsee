@@ -15,7 +15,8 @@ import { firefox } from "playwright-core";
 import {
   toLaunchOptions,
   buildLdLibraryPath,
-  gtkLibDir,
+  gtkLibDirCandidates,
+  hasGtkLib,
   resolveInstallDir,
   assembleCamoufoxOptions,
 } from "./dist/camoufox.js";
@@ -36,9 +37,33 @@ function test(name, fn) {
 
 console.log("camoufox integration-layer unit tests\n");
 
-// --- gtkLibDir -------------------------------------------------------------
-test("gtkLibDir points at the pixi env's lib dir", () => {
-  assert.equal(gtkLibDir("/home/u"), "/home/u/camoufox/.pixi/envs/default/lib");
+// --- gtkLibDirCandidates ---------------------------------------------------
+test("gtkLibDirCandidates orders env override, pixi env, cwd env, then system", () => {
+  const dirs = gtkLibDirCandidates("/home/u", {
+    BROWSEE_GTK_LIB_DIR: "/override",
+    PATH: "/usr/bin",
+  });
+  assert.deepEqual(dirs, [
+    "/override",
+    "/home/u/camoufox/.pixi/envs/default/lib",
+    join(process.cwd(), "camoufox", ".pixi", "envs", "default", "lib"),
+    "/usr/lib",
+    "/lib",
+  ]);
+});
+
+test("gtkLibDirCandidates drops an unset env override", () => {
+  const dirs = gtkLibDirCandidates("/home/u", {});
+  assert.equal(dirs[0], "/home/u/camoufox/.pixi/envs/default/lib");
+  assert.ok(!dirs.includes(""), "no empty entries");
+});
+
+test("hasGtkLib reflects the filesystem (system libgtk-3 present on this image)", () => {
+  // The spacebotX Wolfi image bakes libgtk-3 in /usr/lib, so this must be true
+  // here; on a bare image it would be false and that is the point of the
+  // candidate search.
+  assert.equal(hasGtkLib("/usr/lib"), true);
+  assert.equal(hasGtkLib("/nonexistent-dir-xyz"), false);
 });
 
 // --- buildLdLibraryPath ----------------------------------------------------
@@ -133,7 +158,12 @@ testAsync("assembleCamoufoxOptions wires LD_LIBRARY_PATH and returns firefox lau
   // Everything playwright's firefox() needs must be present.
   assert.ok("executablePath" in opts, "executablePath set by the package");
   assert.ok("env" in opts, "env set");
-  assert.equal(opts.env.LD_LIBRARY_PATH, "/home/u/camoufox/.pixi/envs/default/lib:/bin/dir:/old");
+  // The GTK dir is RESOLVED to the first candidate that actually has
+  // libgtk-3.so.0. /home/u has no pixi env, but this image ships system GTK in
+  // /usr/lib, so that wins — then the browser dir, then the caller's existing
+  // LD_LIBRARY_PATH. (On an image without system GTK this would resolve to the
+  // pixi candidate instead; the resolution logic is what we assert here.)
+  assert.equal(opts.env.LD_LIBRARY_PATH, "/usr/lib:/bin/dir:/old");
   assert.equal(opts.env.MOZ_HEADLESS, "1");
   assert.ok(opts.env.CAMOU_CONFIG_1, "chunked CAMOU_CONFIG present");
   // And the object round-trips as a valid firefox launch options shape.
