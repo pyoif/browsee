@@ -1,14 +1,23 @@
 # browsee
 
 A **stdio Model Context Protocol (MCP) server** exposing scriptable, steerable
-browser sessions. Built with `@modelcontextprotocol/sdk` + `playwright-core`.
+browser sessions. Built with `@modelcontextprotocol/sdk` + `patchright` (the
+patched, undetectable Playwright fork) for Chromium, and `playwright-core` for
+the camoufox/Firefox stealth path.
 
 Two engines:
 
-| Engine | When | Binary | Notes |
-|---|---|---|---|
-| **camoufox** | `stealth: true` (default) | `$HOME/.cache/camoufox/browsers/official/*/camoufox-bin` | Stealth Firefox build; launched via `playwright-core`'s `firefox()` with `LD_LIBRARY_PATH` pointed at the pixi GTK env. |
-| **chromium** | `stealth: false` | playwright-core's bundled Chromium | Must already be installed; this server **never downloads** a browser at runtime. |
+| Engine | When | Binary | Driver | Notes |
+|---|---|---|---|---|
+| **camoufox** | `stealth: true` (default) | `$HOME/.cache/camoufox/browsers/official/*/camoufox-bin` | `playwright-core`'s `firefox()` | Stealth Firefox build, launched with `LD_LIBRARY_PATH` pointed at the pixi GTK env. |
+| **chromium** | `stealth: false` | patchright's Chromium (`~/.cache/ms-playwright/chromium-<rev>`) | `patchright`'s `chromium()` | Undetectable via the **patched driver** (not just a patched binary). Install with `browser_install_chromium`. |
+
+> **Why the split driver?** Patchright's stealth comes from its patched driver
+> code (no `Runtime.enable` leaks, etc.), so Chromium must be driven by
+> `patchright`, not vanilla `playwright-core`. But camoufox is a *Firefox* build
+> whose patched juggler is incompatible with patchright's patched Firefox driver
+> (`page.evaluate` throws `Cannot read properties of undefined (reading '_client')`),
+> so camoufox stays on vanilla `playwright-core`'s `firefox()`.
 
 > **Why `firefox()` and not `chromium()` for camoufox?** camoufox is a Firefox
 > build. Driving it through `chromium.launch()` sends Chromium flags and a CDP
@@ -19,7 +28,7 @@ Two engines:
 
 ```sh
 mise use nub@latest          # Node toolkit, project-scoped
-nub install                  # install deps (@modelcontextprotocol/sdk, playwright-core, zod)
+nub install                  # installs @modelcontextprotocol/sdk, patchright, playwright-core, zod
 nub exec tsc -p tsconfig.build.json   # build -> dist/server.js
 ```
 
@@ -83,6 +92,43 @@ An unknown action returns an `isError` result — the server never crashes.
 | `save` | writes a full storage-state JSON to `path`; returns `{ ok, path, cookies, origins }` |
 | `load` | reads storage state from `path` and adds its cookies to the context |
 
+### Tab management
+
+A session can hold multiple tabs (pages) in one browser context. `browser_action`
+and `browser_cookies` always operate on the session's **active** tab.
+
+| tool | args | behaviour |
+|---|---|---|
+| `browser_tab_list` | `{ session_id }` | `{ count, active, tabs: [{ index, url, title, active }] }` |
+| `browser_tab_new` | `{ session_id, url? }` | opens a tab, makes it active → `{ ok, index, url, count }` |
+| `browser_tab_select` | `{ session_id, index }` | switches the active tab → `{ ok, index, url, title }` |
+| `browser_tab_close` | `{ session_id, index }` | closes a tab; active falls back to the last remaining → `{ ok, closed, remaining, active }` |
+
+Indices are the positions in the context's live page list (see
+`browser_tab_list`). Out-of-range indices return an `isError` result.
+
+### `browser_install_chromium`
+
+`{}` → downloads the **exact** Chromium build this server's `patchright` expects
+(revision read from `patchright-core/browsers.json`) into the Playwright browsers
+directory (`$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright/chromium-<rev>`),
+then writes Playwright's `INSTALLATION_COMPLETE` marker.
+
+- Installs the **full** Chromium build, never `chromium_headless_shell` (the
+  shell is detectable; patchright's own guidance is to use the full build).
+- The modern revision is a Chrome-for-Testing build, fetched from
+  `https://cdn.playwright.dev/builds/cft/<browserVersion>/<platform>/…`.
+- Zero dependencies: the ZIP is downloaded with Node's `fetch` and extracted
+  with a built-in zlib-based ZIP reader (`src/zip.ts`).
+- Idempotent: returns `{ alreadyInstalled: true }` when the build is present.
+
+### `browser_install_camoufox`
+
+`{}` → downloads the latest camoufox Linux build from GitHub releases into the
+layout the server expects (`$CAMOUFOX_INSTALL_DIR` or `~/.cache/camoufox`, i.e.
+`…/browsers/official/<tag>/camoufox-bin`). Idempotent: if a camoufox build is
+already present it reports it and does **not** re-download.
+
 ## Zombie prevention
 
 - All live sessions are tracked in an in-memory `Map`.
@@ -105,3 +151,17 @@ bogus action → browser_kill → browser_list(empty)`.
 - Screenshots: `$HOME/browsee/artifacts/`
 - camoufox binary: `$HOME/.cache/camoufox/browsers/official/*/camoufox-bin`
 - GTK libs: `$HOME/camoufox/.pixi/envs/default/lib`
+- Chromium (patchright): `$PLAYWRIGHT_BROWSERS_PATH` or `$HOME/.cache/ms-playwright/chromium-<rev>/`
+- libudev shim: `$HOME/.local/lib/udev` (Chromium links `libudev.so.1`, absent from the Wolfi image)
+
+## Note on `LD_LIBRARY_PATH`
+
+`run.sh` prepends `$HOME/.local/lib/udev` and the pixi GTK lib dir to
+`LD_LIBRARY_PATH` so:
+1. Node (fetched by nub) finds `libatomic`;
+2. camoufox's Firefox finds `libgtk-3`/X11 libs;
+3. Chromium finds `libudev.so.1`.
+
+The server also self-heals for (3): `launchChromium` scans for a `libudev.so.1`
+provider on disk and appends it to the child's `LD_LIBRARY_PATH`, so a Chromium
+session works even when the server is launched without `run.sh`.
