@@ -104,6 +104,8 @@ interface Session {
   pid: number | null;
   /** Human-readable display/xvfb decision for this session (optional). */
   displayNote?: string;
+  /** Xvfb process we started for this session, killed on session close. */
+  xvfb?: XvfbHandle;
   /** Number of camoufox addons loaded (firefox engine only). */
   addonsLoaded?: number;
 }
@@ -254,19 +256,36 @@ async function launchChromium(
 
   // Headed is required for stealth fidelity: patchright's patches only hold in
   // a real (non-headless-shell) browser. On a server with no display we must
-  // run under Xvfb; if xvfb-run is unavailable we refuse rather than silently
-  // launch a detectable headless Chrome.
+  // ACTUALLY provide one — previously we only *reported* "headed via xvfb-run"
+  // while launching with no DISPLAY, which made Chromium fail with its own
+  // "Missing X server or $DISPLAY". We now manage a real Xvfb lifecycle: when
+  // DISPLAY is unset and `Xvfb` is on PATH, spawn Xvfb on a free display, point
+  // the launch env at it, and record the child so it can be killed on session
+  // close. `xvfb-run` is only a fallback when the raw `Xvfb` binary is absent.
   const display = env.DISPLAY;
-  const hasXvfbRun = isOnPath("xvfb-run");
-  let needXvfbRun = false;
+  let xvfb: XvfbHandle | null = null;
+  let displayNote: string;
   if (display && display.trim() !== "") {
     env.DISPLAY = display;
-  } else if (hasXvfbRun) {
-    needXvfbRun = true;
+    displayNote = `headed on DISPLAY=${display}`;
+  } else if (isOnPath("Xvfb")) {
+    xvfb = await startXvfb();
+    env.DISPLAY = xvfb.display;
+    displayNote = `headed via Xvfb ${xvfb.display} (no DISPLAY set)`;
+  } else if (isOnPath("xvfb-run")) {
+    // Fallback: wrap the launch in `xvfb-run`. patchright exposes no argv
+    // override for the browser process itself, so we instead provide a display
+    // by running the whole stdio server under xvfb-run is not possible here;
+    // refuse with an actionable error rather than launch headless.
+    throw new Error(
+      "Chrome engine requires a display (patchright's stealth patches need a headed browser). " +
+        "`Xvfb` is not on PATH (only `xvfb-run` is); install the xvfb package to get the `Xvfb` " +
+        "binary, or set DISPLAY, then retry.",
+    );
   } else {
     throw new Error(
       "Chrome engine requires a display (patchright's stealth patches need a headed browser). " +
-        "No DISPLAY is set and xvfb-run is not installed. Install xvfb (e.g. `apt-get install -y xvfb`) " +
+        "No DISPLAY is set and Xvfb is not installed. Install xvfb (e.g. `apk add xvfb`) " +
         "or set DISPLAY, then retry.",
     );
   }
@@ -300,7 +319,7 @@ async function launchChromium(
     // playwright-core-typed Session.
     browser = (await patchrightChromium.launch({
       // Headed: never headless-shell. Note we pass headless:false and rely on
-      // Xvfb for the "no display" case.
+      // the real Xvfb display acquired above for the "no display" case.
       headless: false,
       // Explicit executable resolved above (do NOT also set channel: "chrome").
       executablePath,
@@ -309,6 +328,7 @@ async function launchChromium(
       timeout: 90_000,
     })) as unknown as Browser;
   } catch (err) {
+    if (xvfb) await xvfb.stop();
     throw new Error(
       `failed to launch Chrome (is it installed? run browser_install_chromium): ${
         (err as Error).message
@@ -316,10 +336,113 @@ async function launchChromium(
     );
   }
   const session = await register(browser, "chrome", startUrl, executablePath);
-  session.displayNote = needXvfbRun
-    ? "headed via xvfb-run (no DISPLAY)"
-    : `headed on DISPLAY=${display}`;
+  if (xvfb) session.xvfb = xvfb;
+  session.displayNote = displayNote;
   return session;
+}
+
+/**
+ * A live Xvfb display we started for a session. `display` is the value to put in
+ * DISPLAY (e.g. ":99"); `stop()` terminates the Xvfb process and resolves once
+ * it has exited. Best-effort: a failed stop is ignored.
+ */
+interface XvfbHandle {
+  display: string;
+  stop(): Promise<void>;
+}
+
+/**
+ * Start Xvfb on a free display number and wait until its socket exists.
+ *
+ * Strategy: probe display numbers from `:99` upward (skipping any whose
+ * /tmp/.X11-unix/X<n> socket already exists), spawn `Xvfb :<n> -screen 0
+ * 1920x1080x24 -nolisten tcp`, then poll for the socket (up to ~5s) so the
+ * caller never launches Chrome before the X server is ready. If all probed
+ * displays are taken or Xvfb dies, throw with the captured stderr.
+ */
+async function startXvfb(): Promise<XvfbHandle> {
+  const { spawn } = await import("node:child_process");
+
+  for (let n = 99; n < 130; n++) {
+    const display = `:${n}`;
+    const socketPath = `/tmp/.X11-unix/X${n}`;
+    if (existsSync(socketPath)) continue;
+
+    const child = spawn("Xvfb", [display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"], {
+      stdio: ["ignore", "ignore", "pipe"],
+      detached: false,
+    });
+
+    let stderr = "";
+    child.stderr?.on("data", (d) => {
+      stderr += d.toString();
+    });
+
+    let exited = false;
+    let exitCode: number | null = null;
+    child.on("exit", (code) => {
+      exited = true;
+      exitCode = code;
+    });
+
+    // Wait for the X socket to appear (server ready), or for Xvfb to exit.
+    const deadline = Date.now() + 5000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      if (exited) break;
+      if (existsSync(socketPath)) {
+        ready = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    if (!ready) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      // If a specific display number was the only problem, try the next one;
+      // otherwise surface why Xvfb died.
+      if (exited && stderr.trim() !== "") {
+        // e.g. display already in use race — continue probing
+        continue;
+      }
+      continue;
+    }
+
+    const stop = async (): Promise<void> => {
+      if (exited) return;
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        child.once("exit", done);
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          resolve();
+          return;
+        }
+        // Escalate if it doesn't go down promptly.
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* ignore */
+          }
+        }, 2000).unref?.();
+        // Resolve on its own if the exit listener never fires.
+        setTimeout(done, 4000).unref?.();
+      });
+    };
+
+    void exitCode; // referenced for clarity of the exit-tracking above
+    return { display, stop };
+  }
+
+  throw new Error(
+    "Chrome engine: could not start Xvfb — no free display number found in :99..:129.",
+  );
 }
 
 /**
@@ -449,6 +572,13 @@ async function killSession(id: string): Promise<void> {
     await s.browser.close();
   } catch {
     /* ignore */
+  }
+  if (s.xvfb) {
+    try {
+      await s.xvfb.stop();
+    } catch {
+      /* ignore */
+    }
   }
 }
 

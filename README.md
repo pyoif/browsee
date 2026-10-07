@@ -210,6 +210,16 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.2** — the chrome engine's "no display" path now **actually provides** a
+  display instead of only reporting one. Previously `needXvfbRun` was set and
+  surfaced as `displayNote` ("headed via xvfb-run (no DISPLAY)") but was never
+  consumed by the launch, so Chromium failed with its own "Missing X server or
+  $DISPLAY". The server now manages a real Xvfb lifecycle: with no `DISPLAY` set
+  and the `Xvfb` binary on `PATH`, it spawns Xvfb on a free display (`:99`
+  upward), waits for the X socket, points the launch env at it, and kills the
+  Xvfb process when the session closes. If neither `DISPLAY` nor `Xvfb` is
+  available it refuses with an actionable error rather than silently launching a
+  detectable headless Chrome.
 - **v0.3.1** — `engine: "chrome"` no longer forces patchright `channel: "chrome"`
   (which looked for a *system* Chrome at `/opt/google/chrome/chrome`). The launch
   now resolves the executable explicitly — env override
