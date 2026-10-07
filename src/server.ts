@@ -252,12 +252,6 @@ async function launchChromium(
     env.LD_LIBRARY_PATH = `${extraLibDirs.join(":")}${existing}`;
   }
 
-  // Patchright's own Best Practice is `chromium.launchPersistentContext(...,
-  // { channel: "chrome", headless: false, viewport: null })` — branded Chrome
-  // For Testing, headed. Patchright's `channel: "chrome"` resolves to the
-  // Chrome-for-Testing build (revision 1243), which is exactly what
-  // browser_install_chromium installs.
-  //
   // Headed is required for stealth fidelity: patchright's patches only hold in
   // a real (non-headless-shell) browser. On a server with no display we must
   // run under Xvfb; if xvfb-run is unavailable we refuse rather than silently
@@ -277,6 +271,26 @@ async function launchChromium(
     );
   }
 
+  // Resolve the executable explicitly instead of forcing `channel: "chrome"`.
+  //
+  // `channel: "chrome"` makes patchright look for a SYSTEM branded Chrome at
+  // /opt/google/chrome/chrome. This container has no system Chrome — the
+  // Chrome-for-Testing build is installed into patchright's browsers cache by
+  // browser_install_chromium. So install location and launch location must be
+  // reconciled by resolving the SAME path the install tool writes to, in this
+  // order:
+  //   (a) an explicit env override (BROWSEE_CHROME_EXECUTABLE / CHROME_PATH),
+  //   (b) the path patchright itself resolves for its managed Chrome-for-Testing
+  //       build (patchright's executablePath()) — the exact location
+  //       browser_install_chromium installs into, so install/launch agree by
+  //       construction,
+  //   (c) /opt/google/chrome/chrome as the last fallback (a real system Chrome),
+  //   (d) otherwise a clear error telling the caller to run
+  //       browser_install_chromium.
+  // `channel` is intentionally NOT set when we resolve an explicit path: passing
+  // both would re-trigger the system-Chrome lookup we're avoiding.
+  const executablePath = resolveChromeExecutable();
+
   const launchArgs = ["--no-sandbox", "--disable-dev-shm-usage"];
 
   let browser: Browser;
@@ -288,7 +302,8 @@ async function launchChromium(
       // Headed: never headless-shell. Note we pass headless:false and rely on
       // Xvfb for the "no display" case.
       headless: false,
-      channel: "chrome",
+      // Explicit executable resolved above (do NOT also set channel: "chrome").
+      executablePath,
       args: launchArgs,
       env,
       timeout: 90_000,
@@ -300,7 +315,7 @@ async function launchChromium(
       }`,
     );
   }
-  const session = await register(browser, "chrome", startUrl, chromiumExecutablePath());
+  const session = await register(browser, "chrome", startUrl, executablePath);
   session.displayNote = needXvfbRun
     ? "headed via xvfb-run (no DISPLAY)"
     : `headed on DISPLAY=${display}`;
@@ -342,6 +357,54 @@ function chromiumExecutablePath(): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve the Chrome executable to launch for `engine: "chrome"`.
+ *
+ * This is the SINGLE source of truth shared (by construction) with
+ * `browser_install_chromium`: the install tool writes the Chrome-for-Testing
+ * build to patchright's managed cache, and `patchrightChromium.executablePath()`
+ * reports exactly that location. Resolving through it here means install and
+ * launch can never disagree again (the previous `channel: "chrome"` forced a
+ * lookup of a SYSTEM Chrome at /opt/google/chrome/chrome that does not exist in
+ * this container).
+ *
+ * Resolution order:
+ *   (a) explicit env override: BROWSEE_CHROME_EXECUTABLE, then CHROME_PATH
+ *   (b) patchright's managed Chrome-for-Testing path (where the install tool puts it)
+ *   (c) /opt/google/chrome/chrome (a real system Chrome), if it exists
+ *   (d) throw a clear error telling the caller to run browser_install_chromium
+ */
+function resolveChromeExecutable(): string {
+  const override = (
+    process.env.BROWSEE_CHROME_EXECUTABLE ||
+    process.env.CHROME_PATH ||
+    ""
+  ).trim();
+  if (override) {
+    if (existsSync(override)) return override;
+    throw new Error(
+      `BROWSEE_CHROME_EXECUTABLE/CHROME_PATH points at "${override}" but that file does not exist.`,
+    );
+  }
+
+  // (b) patchright's own resolution — the SAME location browser_install_chromium
+  // installs into (chromium-<revision>/chrome-linux64/chrome).
+  const managed = chromiumExecutablePath();
+  if (managed && existsSync(managed)) return managed;
+
+  // (c) last resort: a genuine system Chrome.
+  const system = "/opt/google/chrome/chrome";
+  if (existsSync(system)) return system;
+
+  // (d) nothing usable — be explicit about how to fix it.
+  const expected = managed ?? "(patchright could not report a path)";
+  throw new Error(
+    `Chrome engine: no Chrome executable found. Run browser_install_chromium to install the ` +
+      `matching Chrome-for-Testing build (expected at ${expected}), or set ` +
+      `BROWSEE_CHROME_EXECUTABLE to an existing Chrome binary.`,
+  );
 }
 
 async function register(

@@ -210,6 +210,13 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.1** — `engine: "chrome"` no longer forces patchright `channel: "chrome"`
+  (which looked for a *system* Chrome at `/opt/google/chrome/chrome`). The launch
+  now resolves the executable explicitly — env override
+  (`BROWSEE_CHROME_EXECUTABLE` / `CHROME_PATH`) → the patchright-managed
+  Chrome-for-Testing path that `browser_install_chromium` installs into → last
+  resort `/opt/google/chrome/chrome` → a clear "run browser_install_chromium"
+  error. Install location and launch location now agree by construction.
 - **v0.3.0** — `engine: "chrome" | "firefox"` replaces the old `stealth`
   boolean; the `firefox` engine uses the **official** daijro/camoufox TypeScript
   launcher with full capability (fingerprint/addons/fonts/GeoIP/locale/humanize/
