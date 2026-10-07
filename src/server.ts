@@ -46,6 +46,15 @@ import { fileURLToPath } from "node:url";
 import { readdirSync as readdirSyncFs, readlinkSync } from "node:fs";
 import { extractAll } from "./zip.js";
 import { downloadToBuffer, downloadText, logStderr } from "./download.js";
+import {
+  buildCamoufoxPlan,
+  findAddonDirs,
+  isOnPath,
+  loadSupportedProperties,
+  planDisplay,
+  readRelease,
+  type CamoufoxSpawnOptions,
+} from "./camoufox.js";
 
 // ---------------------------------------------------------------------------
 // Paths / environment
@@ -59,7 +68,11 @@ mkdirSync(ARTIFACTS_DIR, { recursive: true });
 /** GTK/X11 libs shipped by the pixi env, needed by camoufox's Firefox build. */
 const GTK_LIB_DIR = join(HOME, "camoufox", ".pixi", "envs", "default", "lib");
 
-/** Locate the camoufox-bin executable inside the fetched browsers cache. */
+/**
+ * Locate the camoufox install directory (the dir containing camoufox-bin,
+ * version.json, properties.json, fontconfig/ and — for the full release — the
+ * addons/ tree). Honors CAMOUFOX_INSTALL_DIR.
+ */
 function findCamoufoxDir(): string | null {
   // Honor CAMOUFOX_INSTALL_DIR when set (the same env var browser_install_camoufox
   // uses), so the two agree on where the browser lives.
@@ -86,6 +99,23 @@ function findCamoufoxInRoot(root: string): { tag: string; dir: string; bin: stri
   return null;
 }
 
+/**
+ * The camoufox release ships its addons next to the browser tree. Depending on
+ * how it was installed the `addons/` dir lives either alongside the build
+ * (`<installRoot>/addons`) or beside the binary. Return the first that exists.
+ */
+function findCamoufoxAddonsRoot(installDir: string): string | null {
+  const candidates = [
+    join(installDir, "addons"),
+    // release root = two levels up from browsers/official/<tag>
+    join(dirname(dirname(installDir)), "addons"),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Session registry
 // ---------------------------------------------------------------------------
@@ -104,6 +134,10 @@ interface Session {
    */
   page: Page;
   pid: number | null;
+  /** Human-readable display/xvfb decision for this session (optional). */
+  displayNote?: string;
+  /** Number of camoufox addons loaded (firefox engine only). */
+  addonsLoaded?: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -171,9 +205,19 @@ function findBrowserPid(exePath: string): number | null {
 // Launch helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Launch the camoufox firefox engine with FULL capability: config assembled into
+ * CAMOU_CONFIG_<n> env vars, the release's addons loaded, FONTCONFIG_PATH set,
+ * and a headed/headless display plan (xvfb-run auto-wrap when available).
+ *
+ * `options` carries the capability knobs (fingerprint, geoip, locale, humanize,
+ * config). Headless handling: full fidelity needs a display; if none is present
+ * we auto-use xvfb-run, else fall back to plain headless and say so.
+ */
 async function launchCamoufox(
   headless: boolean,
   startUrl: string | undefined,
+  options: CamoufoxSpawnOptions = {},
 ): Promise<Session> {
   const dir = findCamoufoxDir();
   if (!dir) {
@@ -188,25 +232,59 @@ async function launchCamoufox(
   }
 
   const bin = join(dir, "camoufox-bin");
-  const env: Record<string, string> = { ...process.env } as Record<string, string>;
-  const existing = env.LD_LIBRARY_PATH ? `:${env.LD_LIBRARY_PATH}` : "";
-  // GTK/X11 libs from the pixi env, plus the browser's own dir for its bundled
-  // libxul/libnss etc.
-  env.LD_LIBRARY_PATH = `${GTK_LIB_DIR}:${dir}${existing}`;
-  env.MOZ_HEADLESS = headless ? "1" : "0";
 
-  // camoufox is a Firefox build, so it must be driven by patchright's
-  // firefox() — chromium() would send Chromium flags + a CDP handshake that
-  // Firefox's juggler never completes.
-  const browser = await playwrightFirefox.launch({
+  // Full release: gather addons + the build's supported-property schema.
+  const addonsRoot = findCamoufoxAddonsRoot(dir);
+  const addons = addonsRoot ? findAddonDirs(addonsRoot) : [];
+  const properties = loadSupportedProperties(dir);
+  const release = readRelease(dir);
+
+  // Base env: GTK/X11 libs from the pixi env + the browser's own dir (its
+  // bundled libxul/libnss etc. live next to the binary).
+  const baseEnv: Record<string, string> = { ...process.env } as Record<string, string>;
+  const existing = baseEnv.LD_LIBRARY_PATH ? `:${baseEnv.LD_LIBRARY_PATH}` : "";
+  baseEnv.LD_LIBRARY_PATH = `${GTK_LIB_DIR}:${dir}${existing}`;
+
+  // Display planning: headed (full fidelity) if a DISPLAY exists or xvfb-run is
+  // available; otherwise plain headless with an explicit note.
+  const hasXvfbRun = isOnPath("xvfb-run");
+  const display = baseEnv.DISPLAY;
+  const plan = planDisplay(headless, hasXvfbRun, display);
+  baseEnv.MOZ_HEADLESS = plan.headless ? "1" : "0";
+  if (plan.display) baseEnv.DISPLAY = plan.display;
+
+  const targetOs = "lin"; // container target
+  const launchPlan = buildCamoufoxPlan({
+    installDir: dir,
     executablePath: bin,
-    headless,
-    env,
-    firefoxUserPrefs: { "network.proxy.type": 0 },
-    timeout: 90_000,
+    properties,
+    addons,
+    options,
+    release,
+    baseEnv,
+    targetOs,
   });
 
-  return register(browser, "camoufox", startUrl, bin);
+  logStderr(
+    `camoufox launch: engine=firefox addons=${addons.length} properties=${properties.size} display=${plan.note}`,
+  );
+
+  // camoufox is a Firefox build driven by vanilla playwright-core's firefox()
+  // (patchright's patched firefox driver is incompatible with camoufox's
+  // patched juggler — page.evaluate breaks).
+  const launchOpts = {
+    executablePath: bin,
+    headless: plan.headless,
+    env: launchPlan.env,
+    firefoxUserPrefs: launchPlan.firefoxUserPrefs as Record<string, string | number | boolean>,
+    timeout: 90_000,
+  };
+  const browser = (await playwrightFirefox.launch(launchOpts)) as unknown as Browser;
+
+  const session = await register(browser, "camoufox", startUrl, bin);
+  session.displayNote = plan.note;
+  session.addonsLoaded = addons.length;
+  return session;
 }
 
 async function launchChromium(
@@ -417,7 +495,7 @@ async function runAction(
 // MCP server
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "browsee", version: "0.2.0" });
+const server = new McpServer({ name: "browsee", version: "0.3.0" });
 
 function text(value: unknown) {
   return {
@@ -439,26 +517,40 @@ server.registerTool(
   {
     title: "Spawn browser session",
     description:
-      "Launch a browser session. stealth=true (default) uses the camoufox stealth Firefox; stealth=false uses bundled Chromium.",
+      "Launch a browser session. stealth=true (default) uses the camoufox stealth Firefox (full capability: fingerprint config, addons, locale/geoip/humanize); stealth=false uses patchright-driven Chrome.",
     inputSchema: {
       session_id: z.string().optional(),
       headless: z.boolean().optional(),
       start_url: z.string().optional(),
       stealth: z.boolean().optional(),
+      // camoufox (stealth=true) capability knobs:
+      fingerprint: z.record(z.string(), z.unknown()).optional(),
+      geoip: z.union([z.string(), z.boolean()]).optional(),
+      locale: z.union([z.string(), z.array(z.string())]).optional(),
+      humanize: z.union([z.boolean(), z.number()]).optional(),
+      config: z.record(z.string(), z.unknown()).optional(),
     },
   },
-  async ({ headless, start_url, stealth }) => {
+  async ({ headless, start_url, stealth, fingerprint, geoip, locale, humanize, config }) => {
     try {
       const useStealth = stealth ?? true;
+      const camoufoxOptions: CamoufoxSpawnOptions = {};
+      if (fingerprint) camoufoxOptions.fingerprint = fingerprint as Record<string, unknown>;
+      if (geoip !== undefined) camoufoxOptions.geoip = geoip;
+      if (locale !== undefined) camoufoxOptions.locale = locale;
+      if (humanize !== undefined) camoufoxOptions.humanize = humanize;
+      if (config) camoufoxOptions.config = config as Record<string, unknown>;
       const session =
         useStealth === true
-          ? await launchCamoufox(headless ?? true, start_url)
+          ? await launchCamoufox(headless ?? true, start_url, camoufoxOptions)
           : await launchChromium(headless ?? true, start_url);
       return text({
         session_id: session.id,
         engine: session.engine,
         headless: headless ?? true,
         url: activePage(session).url(),
+        ...(session.displayNote ? { display: session.displayNote } : {}),
+        ...(session.addonsLoaded !== undefined ? { addons: session.addonsLoaded } : {}),
       });
     } catch (err) {
       return errorResult(err);
@@ -896,12 +988,55 @@ server.registerTool(
   },
 );
 
+/**
+ * Summarize an installed camoufox build's layout: the binary, whether the
+ * addons/ tree + properties.json + fontconfig are present (the pieces the
+ * full-capability launcher reads), and the addon names found.
+ */
+function describeCamoufoxLayout(dest: string, root: string): {
+  executable: boolean;
+  addonsDir: string | null;
+  addons: string[];
+  propertiesJson: boolean;
+  fontconfig: boolean;
+  versionJson: boolean;
+  auxFiles: string[];
+} {
+  const addonsRootCandidates = [join(dest, "addons"), join(root, "addons")];
+  let addonsDir: string | null = null;
+  for (const c of addonsRootCandidates) {
+    if (existsSync(c)) {
+      addonsDir = c;
+      break;
+    }
+  }
+  const addons = addonsDir ? findAddonDirs(addonsDir).map((p) => p.split("/").pop() ?? p) : [];
+  const versionJsonPath = join(dest, "version.json");
+  return {
+    executable: existsSync(join(dest, "camoufox-bin")),
+    addonsDir,
+    addons,
+    propertiesJson: existsSync(join(dest, "properties.json")),
+    fontconfig: existsSync(join(dest, "fontconfig")),
+    versionJson: existsSync(versionJsonPath),
+    auxFiles: [
+      "application.ini",
+      "platform.ini",
+      "camoufox.cfg",
+      "chrome.css",
+      "dependentlibs.list",
+      "fonts",
+      "defaults",
+    ].filter((f) => existsSync(join(dest, f))),
+  };
+}
+
 server.registerTool(
   "browser_install_camoufox",
   {
-    title: "Install camoufox stealth browser",
+    title: "Install camoufox firefox browser",
     description:
-      "Download the latest camoufox Linux build from GitHub releases into the directory server.ts expects for stealth mode (~/.cache/camoufox, or CAMOUFOX_INSTALL_DIR), so browser_spawn with stealth=true works. Zero dependencies: ZIP fetched from GitHub and extracted with Node's zlib.",
+      "Download the latest camoufox Linux build from GitHub releases into the directory server.ts expects (~/.cache/camoufox, or CAMOUFOX_INSTALL_DIR), so browser_spawn works. Extracts the FULL release (binary + addons/ + fontconfig/ + properties.json) so the full-capability launcher can load addons and validate config. Zero dependencies: ZIP fetched from GitHub and extracted with Node's zlib.",
     inputSchema: {},
   },
   async () => {
@@ -1017,6 +1152,9 @@ server.registerTool(
         /* non-fatal */
       }
 
+      // Report the FULL installed layout so callers can confirm the launcher
+      // has everything it needs (binary + addons + fontconfig + properties.json).
+      const layout = describeCamoufoxLayout(dest, root);
       return text({
         ok: true,
         component: "camoufox",
@@ -1029,6 +1167,7 @@ server.registerTool(
         source: srcUrl,
         installRoot: root,
         config: configPath,
+        layout,
       });
     } catch (err) {
       return errorResult(err);
