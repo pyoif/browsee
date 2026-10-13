@@ -37,6 +37,18 @@ Three runtime packages, all real (no vendoring):
 - `playwright-core` — bundled here so the camoufox launcher's driver types and
   browser resolution are available.
 
+> **Both drivers are pinned EXACT (`1.63.0`), never a caret — do not "helpfully" widen this.**
+> `playwright-core` 1.64.0 removed the Firefox WebSocket-handshake workaround and re-enabled
+> the strict `FFPage._onWebSocketOpened` assert (upstream
+> [microsoft/playwright#42455](https://github.com/microsoft/playwright/issues/42455)), premised
+> on Firefox carrying patch `D310690`. **Camoufox is a patched Firefox build that does not**, so
+> the first WebSocket handshake threw an `Assertion error` inside a global event handler and
+> killed the whole MCP server process. With a caret, a fresh resolve (e.g. `nubx`'s dlx install
+> on the live server) pulled 1.64.0 even while the workspace checkout still had 1.63.0 — so the
+> crash appeared only sometimes. 1.63.0 is the last release with the workaround and the only
+> 1.63.x on the registry. Upgrading camoufox is not an alternative: the fork's juggler does not
+> carry the patched handshake behaviour that assert assumes.
+
 ## Install
 
 ```sh
