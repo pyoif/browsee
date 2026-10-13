@@ -709,6 +709,25 @@ async function killAllSessions(): Promise<void> {
 // Action dispatch
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve the value a `fill` should type. By default that is the literal
+ * `params.value`; when `params.secret` names an environment variable, the value
+ * is read from the server process's own environment instead, so a credential
+ * never has to travel through a tool argument (where it would land in the
+ * caller's transcript). Only the variable NAME is ever echoed back — the
+ * resolved value is never returned, logged or included in an error.
+ */
+function resolveSecretValue(secretName: string): string {
+  const value = process.env[secretName];
+  if (value === undefined) {
+    throw new Error(`fill secret env var is not set: ${secretName}`);
+  }
+  if (value === "") {
+    throw new Error(`fill secret env var is empty: ${secretName}`);
+  }
+  return value;
+}
+
 async function runAction(
   session: Session,
   action: string,
@@ -734,8 +753,16 @@ async function runAction(
     case "fill": {
       const selector = params.selector as string;
       if (!selector) throw new Error("fill requires params.selector");
-      await page.fill(selector, String(params.value ?? ""), { timeout: 30_000 });
-      return { ok: true };
+      // `secret` names an env var to read the value from; it wins over `value`.
+      const secretName =
+        params.secret === undefined || params.secret === null
+          ? undefined
+          : String(params.secret);
+      const value = secretName
+        ? resolveSecretValue(secretName)
+        : String(params.value ?? "");
+      await page.fill(selector, value, { timeout: 30_000 });
+      return { ok: true, ...(secretName ? { secret: secretName } : {}) };
     }
     case "press": {
       const key = params.key as string;
@@ -910,7 +937,7 @@ server.registerTool(
   {
     title: "Browser action",
     description:
-      "Dispatch an action on a live session's page: navigate, click, fill, press, evaluate, screenshot, wait_for, status.",
+      "Dispatch an action on a live session's page: navigate, click, fill, press, evaluate, screenshot, wait_for, status. fill takes either params.value (literal) or params.secret (the NAME of an env var in this server's environment; the resolved value is never echoed back).",
     inputSchema: {
       session_id: z.string(),
       action: z.string(),

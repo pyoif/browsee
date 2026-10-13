@@ -10,6 +10,9 @@
  *   6. mode=load into a LIVE session (no spawn-time seeding) → cookies AND
  *      localStorage restored, with no scratch tab left behind
  *   7. an unreachable origin is reported in skippedOrigins, not fatal
+ *   8. fill with params.secret resolves from the server's environment (the name
+ *      is echoed back, the value never is), secret beats an explicit value, a
+ *      literal fill is unchanged, and an unset variable is a clear error
  *
  * Run: node storage-state.e2e.mjs   (browsers already installed in the workspace cache)
  */
@@ -19,6 +22,13 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const REPO = process.env.BROWSEE_DIR ?? process.cwd();
 const ARTIFACTS = process.env.BROWSEE_ARTIFACTS_DIR ?? `${REPO}/artifacts`;
+
+// fill+secret fixture. The server resolves `params.secret` from ITS OWN
+// environment, so the variable has to be set before run.sh is spawned — and the
+// value never travels through a tool argument (that is the point of the feature).
+const SECRET_NAME = "BROWSEE_E2E_FILL_SECRET";
+const SECRET_VALUE = "fill-fixture-7f3a";
+process.env[SECRET_NAME] = SECRET_VALUE;
 const STATE = `${ARTIFACTS}/e2e-storage-state.json`;
 const MIXED_STATE = `${ARTIFACTS}/e2e-storage-state-mixed.json`;
 
@@ -152,6 +162,64 @@ try {
   );
   await tool("browser_kill", { session_id: s4.session_id });
   rmSync(MIXED_STATE, { force: true });
+
+  // 8. browser_action fill with params.secret: the value is read from the
+  //    server's own environment, never passed as a tool argument, and never
+  //    echoed back (only the variable NAME is).
+  const sp5 = await tool("browser_spawn", { engine: "firefox" });
+  const s5 = txt(sp5);
+  check("spawn session for fill+secret", !!s5.session_id, s5);
+  await tool("browser_action", { session_id: s5.session_id, action: "navigate", params: { url: ORIGIN } });
+  await tool("browser_action", {
+    session_id: s5.session_id, action: "evaluate",
+    params: { js: `document.body.innerHTML = "<input id='pw'><input id='plain'>"; 'ready'` },
+  });
+
+  const fillSecret = txt(await tool("browser_action", {
+    session_id: s5.session_id, action: "fill", params: { selector: "#pw", secret: SECRET_NAME },
+  }));
+  check("fill with secret succeeds", fillSecret.ok === true, fillSecret);
+  check("fill echoes the secret NAME only", fillSecret.secret === SECRET_NAME, fillSecret);
+  check("fill result carries no value", !JSON.stringify(fillSecret).includes(SECRET_VALUE), fillSecret);
+
+  const typedSecret = txt(await tool("browser_action", {
+    session_id: s5.session_id, action: "evaluate", params: { js: `document.querySelector('#pw').value` },
+  }));
+  const readBack = typedSecret?.result ?? typedSecret?.value;
+  check("secret value reached the field", readBack === SECRET_VALUE, { matched: readBack === SECRET_VALUE });
+
+  // secret wins over an explicit value
+  await tool("browser_action", {
+    session_id: s5.session_id, action: "fill",
+    params: { selector: "#pw", value: "literal-should-be-ignored", secret: SECRET_NAME },
+  });
+  const afterBoth = txt(await tool("browser_action", {
+    session_id: s5.session_id, action: "evaluate", params: { js: `document.querySelector('#pw').value` },
+  }));
+  const readBackBoth = afterBoth?.result ?? afterBoth?.value;
+  check("secret wins over value", readBackBoth === SECRET_VALUE, { matched: readBackBoth === SECRET_VALUE });
+
+  // a literal fill is unchanged
+  const fillPlain = txt(await tool("browser_action", {
+    session_id: s5.session_id, action: "fill", params: { selector: "#plain", value: "literal-ok" },
+  }));
+  check("literal fill still works", fillPlain.ok === true && !("secret" in fillPlain), fillPlain);
+
+  // an unset variable is a clear error naming the variable, and the server survives
+  const fillMissing = await tool("browser_action", {
+    session_id: s5.session_id, action: "fill", params: { selector: "#pw", secret: "BROWSEE_E2E_NOT_SET" },
+  });
+  const missingText = fillMissing?.result?.content?.[0]?.text ?? "";
+  check(
+    "unset secret errors clearly",
+    fillMissing?.result?.isError === true && /is not set/.test(missingText),
+    { isError: fillMissing?.result?.isError },
+  );
+  check("error names the variable", /BROWSEE_E2E_NOT_SET/.test(missingText), { named: /BROWSEE_E2E_NOT_SET/.test(missingText) });
+
+  const aliveAfter = txt(await tool("browser_action", { session_id: s5.session_id, action: "status" }));
+  check("server survives the failed fill", typeof aliveAfter?.url === "string", aliveAfter);
+  await tool("browser_kill", { session_id: s5.session_id });
 
   // validation failures
   const bad = await tool("browser_spawn", { engine: "firefox", storage_state: "definitely-missing.json" });

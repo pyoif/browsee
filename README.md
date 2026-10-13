@@ -118,7 +118,7 @@ silently starting a fresh, logged-out context.
 |---|---|---|
 | `navigate` | `url`, `waitUntil?` | `{ url, status, title }` |
 | `click` | `selector` | `{ ok, url }` |
-| `fill` | `selector`, `value` | `{ ok }` |
+| `fill` | `selector`, `value` \| `secret?` | `{ ok, secret? }` |
 | `press` | `key`, `selector?` | `{ ok }` |
 | `evaluate` | `js` | `{ value }` |
 | `wait_for` | `selector`, `timeout?` | `{ ok }` |
@@ -126,6 +126,21 @@ silently starting a fresh, logged-out context.
 | `status` | — | `{ url, title, bodyText }` |
 
 An unknown action returns an `isError` result — the server never crashes.
+
+`fill` writes a literal string by default. Passing **`secret`** — the *name* of
+an environment variable — makes it resolve the value in the **server process's
+own environment** instead, so a credential never travels through a tool
+argument, where it would land in the caller's transcript:
+
+```
+browser_action { session_id, action: "fill",
+                 params: { selector: "#password", secret: "FIVERR_PASSWORD" } }
+```
+
+Only the name comes back (`{ ok, secret }`); the resolved value is never
+returned, logged or put in an error message. A variable that is unset or empty
+fails the fill with a clear error, and when `secret` is present `value` is
+ignored.
 
 ### `browser_cookies`
 `{ session_id, mode, path? }` — the cookie wiring:
@@ -237,7 +252,11 @@ respawn with `storage_state` → assert localStorage and cookie are restored;
 then a **live** `mode=load` into a session that never had the state seeded →
 assert cookies + localStorage are restored with no scratch tab left behind; then
 a tolerance leg where an unreachable origin comes back in `skippedOrigins`
-without failing the load.
+without failing the load; and a `fill` leg where `params.secret` resolves the
+value from the server's own environment — proving the name is echoed back and the
+value never appears in a result, that `secret` beats an explicit `value`, that a
+literal `fill` is unchanged, and that an unset variable is a clear error the
+server survives.
 Unit tests (`node camoufox.test.mjs`) include the six `resolveStorageStatePath`
 validation cases.
 
@@ -280,6 +299,15 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.6** — `browser_action` `fill` accepts `secret`, the *name* of an
+  environment variable, and resolves the fill value from the server process's own
+  environment rather than the literal `value` param. Credentials stop travelling
+  through tool arguments (and therefore stop landing in the caller's transcript);
+  the result echoes the name only (`{ ok, secret }`) and the resolved value is
+  never returned, logged or included in an error. An unset or empty variable
+  fails the fill with a clear error; when `secret` is given, `value` is ignored.
+  The README action table and the tool description both document it, and
+  `storage-state.e2e.mjs` covers the round-trip plus the unset-variable error.
 - **v0.3.5** — `browser_cookies mode=load` now restores per-origin localStorage
   as well as cookies, so a save → load round-trip is lossless inside a *live*
   session. localStorage is seeded per origin through a scratch page (it can only
