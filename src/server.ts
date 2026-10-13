@@ -532,6 +532,117 @@ function resolveChromeExecutable(): string {
   );
 }
 
+/** Per-origin entry inside a Playwright storage-state file. */
+interface StorageStateOrigin {
+  origin: string;
+  localStorage?: unknown;
+}
+
+/** Upper bound on origins seeded by one `mode=load` (a guard, not a target —
+ * real storage states carry a handful of origins). */
+const MAX_ORIGIN_SEEDS = 20;
+
+/** How long the scratch page may take to reach an origin before we skip it. */
+const ORIGIN_SEED_NAV_TIMEOUT_MS = 30_000;
+
+interface OriginSeedResult {
+  restored: string[];
+  skipped: { origin: string; reason: string }[];
+  keys: number;
+}
+
+/** Narrow an unknown `origins` field from a storage-state file. */
+function asStorageStateOrigins(value: unknown): StorageStateOrigin[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (v): v is StorageStateOrigin =>
+      !!v && typeof v === "object" && typeof (v as { origin?: unknown }).origin === "string",
+  );
+}
+
+/**
+ * Seed per-origin localStorage from a storage-state file into a LIVE context.
+ *
+ * Playwright can only seed localStorage while a context is being created
+ * (`newContext({ storageState })`); there is no context-level setter, and
+ * `addCookies` covers cookies alone. In an already-live context the only route
+ * is to *be on the origin* and write through a page — which is what this does.
+ *
+ * One scratch page is reused for every origin and closed again at the end, so
+ * the caller's tabs (and the session's active-tab indices) are left untouched.
+ *
+ * Tolerant by contract: an origin that cannot be reached, or carries no usable
+ * key/value pairs, is reported in `skipped` and never fails the whole load.
+ * `browser_spawn`'s `storage_state` remains the preferred full restore — it
+ * seeds at context creation without navigating anywhere.
+ */
+async function seedOriginStorage(
+  session: Session,
+  origins: StorageStateOrigin[],
+): Promise<OriginSeedResult> {
+  const restored: string[] = [];
+  const skipped: { origin: string; reason: string }[] = [];
+  let keys = 0;
+  let scratch: Page | null = null;
+
+  try {
+    for (const [index, entry] of origins.entries()) {
+      const origin = entry.origin;
+      if (index >= MAX_ORIGIN_SEEDS) {
+        skipped.push({ origin, reason: `origin cap reached (${MAX_ORIGIN_SEEDS})` });
+        continue;
+      }
+      // Only real web origins can host localStorage we can write to.
+      if (!/^https?:\/\//i.test(origin)) {
+        skipped.push({ origin, reason: "not an http(s) origin" });
+        continue;
+      }
+      const raw = Array.isArray(entry.localStorage) ? entry.localStorage : [];
+      const items = raw.filter(
+        (kv): kv is { name: string; value: string } =>
+          !!kv &&
+          typeof kv === "object" &&
+          typeof (kv as { name?: unknown }).name === "string" &&
+          typeof (kv as { value?: unknown }).value === "string",
+      );
+      if (items.length === 0) {
+        // Nothing to write. Still a success: this origin needs no seeding.
+        restored.push(origin);
+        continue;
+      }
+      try {
+        scratch ??= await session.context.newPage();
+        await scratch.goto(origin, {
+          waitUntil: "domcontentloaded",
+          timeout: ORIGIN_SEED_NAV_TIMEOUT_MS,
+        });
+        // localStorage is only writable from the origin itself, so the write has
+        // to run through a page that is ON that origin. String form (like the
+        // `evaluate` action) keeps this free of DOM typings.
+        const script =
+          `(() => { const items = ${JSON.stringify(items)}; ` +
+          `for (const kv of items) localStorage.setItem(kv.name, kv.value); ` +
+          `return items.length; })()`;
+        await scratch.evaluate(script);
+        keys += items.length;
+        restored.push(origin);
+      } catch (err) {
+        skipped.push({ origin, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  } finally {
+    if (scratch) {
+      try {
+        await scratch.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  return { restored, skipped, keys };
+}
+
 async function register(
   browser: Browser,
   engine: Engine,
@@ -822,7 +933,7 @@ server.registerTool(
   {
     title: "Browser cookies / storage state",
     description:
-      "Storage-state tool. mode=get returns cookies; mode=save writes a FULL storage-state JSON (cookies + per-origin localStorage) to path; mode=load re-injects COOKIES ONLY into the live context (localStorage is NOT restored by load). For a full save→restore round-trip including localStorage, save here then spawn a new session with browser_spawn's storage_state=<path> — restore happens at context creation, which is the only point localStorage can be seeded.",
+      "Storage-state tool. mode=get returns cookies; mode=save writes a FULL storage-state JSON (cookies + per-origin localStorage) to path; mode=load re-injects cookies AND per-origin localStorage into the LIVE context (localStorage is seeded per origin through a scratch page that is closed again; unreachable origins come back in skippedOrigins instead of failing the load). browser_spawn's storage_state remains the preferred full restore — it seeds at context creation without navigating anywhere.",
     inputSchema: {
       session_id: z.string(),
       mode: z.enum(["get", "save", "load"]),
@@ -847,7 +958,17 @@ server.registerTool(
       const state = JSON.parse(readFileSync(path, "utf8"));
       const cookies = state.cookies ?? [];
       if (cookies.length) await session.context.addCookies(cookies);
-      return text({ ok: true, path, loadedCookies: cookies.length });
+      // Cookies have a context-level API; localStorage does not. Seed it through
+      // a scratch page per origin, then report what could not be reached.
+      const seeded = await seedOriginStorage(session, asStorageStateOrigins(state.origins));
+      return text({
+        ok: true,
+        path,
+        loadedCookies: cookies.length,
+        loadedOrigins: seeded.restored.length,
+        localStorageKeys: seeded.keys,
+        ...(seeded.skipped.length ? { skippedOrigins: seeded.skipped } : {}),
+      });
     } catch (err) {
       return errorResult(err);
     }

@@ -1,22 +1,26 @@
 /**
  * e2e storage-state round-trip test (firefox/camoufox engine — no display needed).
  *
- * Proves the fix for the save/restore asymmetry:
+ * Proves the save/restore contract in both directions:
  *   1. spawn firefox, navigate to a real origin, set localStorage + a cookie
  *   2. browser_cookies mode=save  → full storageState JSON on disk
  *   3. kill the session
  *   4. browser_spawn with storage_state=<that file>  → context created seeded
  *   5. evaluate localStorage on the SAME origin → value must be restored
+ *   6. mode=load into a LIVE session (no spawn-time seeding) → cookies AND
+ *      localStorage restored, with no scratch tab left behind
+ *   7. an unreachable origin is reported in skippedOrigins, not fatal
  *
  * Run: node storage-state.e2e.mjs   (browsers already installed in the workspace cache)
  */
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const REPO = process.env.BROWSEE_DIR ?? process.cwd();
 const ARTIFACTS = process.env.BROWSEE_ARTIFACTS_DIR ?? `${REPO}/artifacts`;
 const STATE = `${ARTIFACTS}/e2e-storage-state.json`;
+const MIXED_STATE = `${ARTIFACTS}/e2e-storage-state-mixed.json`;
 
 const child = spawn("bash", ["run.sh"], { cwd: REPO, stdio: ["pipe", "pipe", "pipe"] });
 const rl = createInterface({ input: child.stdout });
@@ -99,6 +103,55 @@ try {
   check("cookie restored AFTER respawn", hasCookie, cookieCheck.cookies?.map((c) => c.name));
 
   await tool("browser_kill", { session_id: s2.session_id });
+
+  // 6. mode=load into a LIVE session that never had the state seeded at spawn —
+  //    the localStorage restore that only spawn-time seeding used to provide.
+  const sp3 = await tool("browser_spawn", { engine: "firefox" });
+  const s3 = txt(sp3);
+  check("spawn fresh session for mode=load", !!s3.session_id, s3);
+  await tool("browser_action", { session_id: s3.session_id, action: "navigate", params: { url: ORIGIN } });
+  const preLoad = txt(await tool("browser_action", {
+    session_id: s3.session_id, action: "evaluate", params: { js: `localStorage.getItem('browsee_e2e')` },
+  }));
+  check("fresh session starts without the key", preLoad?.result == null || preLoad?.result === "", preLoad);
+
+  const load = txt(await tool("browser_cookies", { session_id: s3.session_id, mode: "load", path: STATE }));
+  check("load reports cookies", load.ok === true && load.loadedCookies >= 1, load);
+  check("load seeded localStorage origins", load.loadedOrigins >= 1 && load.localStorageKeys >= 1, load);
+
+  const postLoad = txt(await tool("browser_action", {
+    session_id: s3.session_id, action: "evaluate", params: { js: `localStorage.getItem('browsee_e2e')` },
+  }));
+  check("localStorage restored by mode=load", postLoad?.result === "restored-42" || postLoad?.value === "restored-42", postLoad);
+
+  const cookieAfterLoad = txt(await tool("browser_cookies", { session_id: s3.session_id, mode: "get" }));
+  check("cookie restored by mode=load", (cookieAfterLoad.cookies ?? []).some((c) => c.name === "browsee_c"), cookieAfterLoad.cookies?.map((c) => c.name));
+
+  const tabs = txt(await tool("browser_tab_list", { session_id: s3.session_id }));
+  check("no scratch tab left behind by load", (tabs.tabs ?? []).length === 1, tabs.tabs?.length);
+
+  await tool("browser_kill", { session_id: s3.session_id });
+
+  // 7. tolerance: an unreachable origin is reported, not fatal.
+  const mixed = JSON.parse(readFileSync(STATE, "utf8"));
+  mixed.origins.push({
+    origin: "https://browsee-unreachable.invalid",
+    localStorage: [{ name: "browsee_e2e_unreachable", value: "x" }],
+  });
+  writeFileSync(MIXED_STATE, JSON.stringify(mixed));
+
+  const sp4 = await tool("browser_spawn", { engine: "firefox" });
+  const s4 = txt(sp4);
+  check("spawn session for tolerant load", !!s4.session_id, s4);
+  const loadMixed = txt(await tool("browser_cookies", { session_id: s4.session_id, mode: "load", path: MIXED_STATE }));
+  check("load survives an unreachable origin", loadMixed.ok === true, loadMixed);
+  check(
+    "unreachable origin reported as skipped",
+    (loadMixed.skippedOrigins ?? []).some((s) => /unreachable/.test(s.origin)),
+    loadMixed.skippedOrigins,
+  );
+  await tool("browser_kill", { session_id: s4.session_id });
+  rmSync(MIXED_STATE, { force: true });
 
   // validation failures
   const bad = await tool("browser_spawn", { engine: "firefox", storage_state: "definitely-missing.json" });
