@@ -134,14 +134,23 @@ An unknown action returns an `isError` result — the server never crashes.
 |---|---|
 | `get` | `{ count, cookies }` from the live context |
 | `save` | writes a full storage-state JSON to `path`; returns `{ ok, path, cookies, origins }` |
-| `load` | reads storage state from `path` and adds **its cookies only** to the live context |
+| `load` | reads storage state from `path`, adds its cookies **and** seeds per-origin localStorage into the live context; returns `{ ok, path, loadedCookies, loadedOrigins, localStorageKeys, skippedOrigins? }` |
 
 `save` captures the full Playwright storage state — cookies plus per-origin
-localStorage. `load` is deliberately cookies-only (it calls
-`context.addCookies`), because localStorage can only be seeded when a context is
-created. For a full save → restore round-trip, including localStorage, save with
-this tool and then spawn a new session with `browser_spawn`'s `storage_state`
-argument pointing at the saved file:
+localStorage. `load` restores **both**: cookies go in through
+`context.addCookies`, and localStorage is seeded per origin through a scratch
+page (navigate to the origin, `localStorage.setItem` each key), because
+Playwright has no context-level setter and only seeds localStorage while a
+context is being created. The scratch page is reused for every origin and closed
+again, so your tabs — and the active-tab index — are untouched.
+
+`load` is tolerant by contract: an origin that cannot be reached (offline, DNS,
+non-http) is reported in `skippedOrigins` and never fails the whole load. At most
+20 origins are seeded per call.
+
+For a round-trip that skips the navigation entirely, `browser_spawn`'s
+`storage_state` remains the preferred path — it seeds cookies + localStorage at
+context creation:
 
 ```
 browser_cookies { session_id, mode: "save", path: "state.json" }
@@ -149,9 +158,9 @@ browser_kill    { session_id }
 browser_spawn   { engine: "firefox", storage_state: "state.json" }
 ```
 
-The restored context comes back with the same cookies and per-origin
-localStorage as the saved session. `sessionStorage` is not captured by either
-path — Playwright's storage-state format excludes it.
+Either route hands back the same cookies and per-origin localStorage as the
+saved session. `sessionStorage` is not captured by either path — Playwright's
+storage-state format excludes it.
 
 ### Tab management
 
@@ -222,9 +231,13 @@ the official `camoufox` package can fetch/manage its own install.
 navigate → evaluate(title) → cookies save → screenshot → browser_list →
 bogus action → browser_kill → browser_list(empty)`.
 
-`node storage-state.e2e.mjs` covers the storage-state round-trip on the firefox
+`nub storage-state.e2e.mjs` covers the storage-state contract on the firefox
 engine: spawn → set localStorage/cookie on a real origin → `save` → kill →
-respawn with `storage_state` → assert localStorage and cookie are restored.
+respawn with `storage_state` → assert localStorage and cookie are restored;
+then a **live** `mode=load` into a session that never had the state seeded →
+assert cookies + localStorage are restored with no scratch tab left behind; then
+a tolerance leg where an unreachable origin comes back in `skippedOrigins`
+without failing the load.
 Unit tests (`node camoufox.test.mjs`) include the six `resolveStorageStatePath`
 validation cases.
 
@@ -267,6 +280,15 @@ so a Chrome session works even when the server is launched without `run.sh`.
 
 ## History
 
+- **v0.3.5** — `browser_cookies mode=load` now restores per-origin localStorage
+  as well as cookies, so a save → load round-trip is lossless inside a *live*
+  session. localStorage is seeded per origin through a scratch page (it can only
+  be written from the origin itself, and Playwright offers no context-level
+  setter); the page is reused across origins and closed again, leaving the
+  caller's tabs and active-tab index untouched. Unreachable origins are reported
+  in `skippedOrigins` instead of failing the load (max 20 origins per call), and
+  the response adds `loadedOrigins` / `localStorageKeys` to `loadedCookies`.
+  `browser_spawn`'s `storage_state` stays the navigation-free preferred path.
 - **v0.3.4** — `browser_spawn` gains `storage_state`, restoring the full saved
   storage state (cookies **and** per-origin localStorage) at context creation for
   both engines. `browser_cookies mode=load` remains cookies-only (localStorage can

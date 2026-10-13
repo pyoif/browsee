@@ -1,6 +1,6 @@
 {
   "name": "browsee",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "type": "module",
   "packageManager": "nub@0.9.5",
   "devEngines": {
