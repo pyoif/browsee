@@ -142,6 +142,11 @@ returned, logged or put in an error message. A variable that is unset or empty
 fails the fill with a clear error, and when `secret` is present `value` is
 ignored.
 
+The variable must exist in the **server process's own** environment. A client
+that spawns browsee with a cleared environment (some daemons keep only `PATH`)
+has to forward the variable to the child explicitly, or the fill fails with
+`fill secret env var is not set: <NAME>`.
+
 ### `browser_cookies`
 `{ session_id, mode, path? }` — the cookie wiring:
 
